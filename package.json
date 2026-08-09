@@ -1,0 +1,37 @@
+{
+  "name": "jar-decompiler-mcp-server",
+  "version": "1.0.0",
+  "description": "Model Context Protocol (MCP) Server for Java JAR Decompilation, Multi-Engine Benchmark, AST Analysis, Obfuscation Renaming, and ASM Bytecode Evaluation",
+  "main": "index.js",
+  "bin": {
+    "jar-decompiler-mcp-server": "./bin/cli.js"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js && node --check src/index.js && node --check src/decompilerHandler.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "decompiler",
+    "cfr",
+    "vineflower",
+    "fernflower",
+    "procyon",
+    "java",
+    "ast",
+    "gumtree-spoon",
+    "bytecode",
+    "asm",
+    "deobfuscation"
+  ],
+  "author": "Antigravity Engineering",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
