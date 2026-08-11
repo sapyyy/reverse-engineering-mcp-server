@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { spawn, execSync } from 'child_process';
+import { spawn, execSync, execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -432,11 +432,15 @@ export function evaluateAndMavenizeSources({
 
   // Helper to test compile a directory with javac debug flags (-g -parameters -proc:none)
   function testCompileCandidate(candDir) {
-    let javacExe = 'javac';
-    const userHome = process.env.USERPROFILE || process.env.HOME || '';
-    const openJdk24Javac = path.join(userHome, '.jdks', 'openjdk-24', 'bin', 'javac.exe');
-    if (fs.existsSync(openJdk24Javac)) {
-      javacExe = openJdk24Javac;
+    let javacExe = 'javac.exe';
+    if (process.env.JAVA_HOME && fs.existsSync(path.join(process.env.JAVA_HOME, 'bin', 'javac.exe'))) {
+      javacExe = path.join(process.env.JAVA_HOME, 'bin', 'javac.exe');
+    } else {
+      const userHome = process.env.USERPROFILE || process.env.HOME || '';
+      const openJdk24Javac = path.join(userHome, '.jdks', 'openjdk-24', 'bin', 'javac.exe');
+      if (fs.existsSync(openJdk24Javac)) {
+        javacExe = openJdk24Javac;
+      }
     }
 
     const javaFiles = [];
@@ -453,20 +457,20 @@ export function evaluateAndMavenizeSources({
     if (javaFiles.length === 0) return { errorCount: 9999, compileSuccess: false };
 
     const listFile = path.join(candDir, 'javac_eval_list.txt');
-    fs.writeFileSync(listFile, javaFiles.join('\n'), 'utf8');
+    const formattedFiles = javaFiles.map(f => `"${f.replace(/\\/g, '/')}"`);
+    fs.writeFileSync(listFile, formattedFiles.join('\n'), 'utf8');
 
     const tempBin = path.join(candDir, 'bin_eval_temp');
     if (!fs.existsSync(tempBin)) fs.mkdirSync(tempBin, { recursive: true });
 
     try {
-      const args = ['-g', '-parameters', '-proc:none', '-encoding', 'UTF-8', '-d', `"${tempBin}"`, `@${listFile}`];
-      const cmdStr = `"${javacExe}" ${args.join(' ')}`;
-      execSync(cmdStr, { stdio: 'pipe', encoding: 'utf8' });
-      return { errorCount: 0, compileSuccess: true, executedCommand: cmdStr };
+      const args = ['-g', '-parameters', '-proc:none', '-encoding', 'UTF-8', '-d', tempBin, `@${listFile}`];
+      execFileSync(javacExe, args, { stdio: 'pipe', encoding: 'utf8' });
+      return { errorCount: 0, compileSuccess: true, executedCommand: `${javacExe} ${args.join(' ')}` };
     } catch (err) {
       const stderr = (err.stderr || '') + '\n' + (err.stdout || '') + '\n' + (err.message || '');
       const lines = stderr.split('\n');
-      const errLines = lines.filter(l => l.includes(': error:'));
+      const errLines = lines.filter(l => l.toLowerCase().includes('error:'));
       return { errorCount: errLines.length || 1, compileSuccess: false, sampleErrors: errLines.slice(0, 5) };
     } finally {
       if (fs.existsSync(listFile)) try { fs.unlinkSync(listFile); } catch (e) {}
@@ -610,7 +614,8 @@ export function evaluateAndMavenizeSources({
       name: e.name,
       score: e.score,
       javaFilesCount: e.analysis.summary.javaFilesCount,
-      decompilationWarningCount: e.analysis.summary.decompilationWarningCount
+      decompilationWarningCount: e.analysis.summary.decompilationWarningCount,
+      compileEval: e.compileEval
     })),
     mavenizedDir: resolvedTargetDir,
     pomCreated: true
