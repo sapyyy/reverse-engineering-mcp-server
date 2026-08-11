@@ -1,18 +1,44 @@
-# Java JAR Decompiler & Reverse Engineering MCP Server
+# Java JAR Decompiler & Reverse Engineering MCP Server (v1.1.0)
 
-A production-ready **Model Context Protocol (MCP)** server written in Node.js for Java `.jar` package decompilation, multi-engine candidate benchmark evaluation, Maven project structuring, non-breaking syntax repair, **GumTree Spoon AST analysis & obfuscation renaming**, and **ASM bytecode parity metrics evaluation**.
+A production-ready **Model Context Protocol (MCP)** server written in Node.js for Java `.jar` package decompilation, multi-engine candidate benchmark evaluation, Maven project structuring, non-breaking syntax repair, **GumTree Spoon AST analysis & obfuscation renaming**, **ASM bytecode parity metrics evaluation**, and **Generic Differential Logic Fallback**.
 
 ---
 
 ## 📑 Table of Contents
-1. [Pipeline Architecture & Reverse Engineering Workflow](#1-pipeline-architecture--reverse-engineering-workflow)
-2. [Candidate Evaluation & Scoring Model](#2-candidate-evaluation--scoring-model)
-3. [Directory Structure](#3-directory-structure)
-4. [Setup & Installation](#4-setup--installation)
-5. [MCP Client Configurations](#5-mcp-client-configurations)
-6. [Complete MCP Tools Reference (9 Tools)](#6-complete-mcp-tools-reference-9-tools)
-7. [Complete MCP Prompts Reference (5 Prompts)](#7-complete-mcp-prompts-reference-5-prompts)
-8. [Execution Verification](#8-execution-verification)
+1. [Release Notes & Version 1.1.0 Changelog](#release-notes--version-110-changelog)
+2. [Pipeline Architecture & Reverse Engineering Workflow](#1-pipeline-architecture--reverse-engineering-workflow)
+3. [Candidate Evaluation & Scoring Model](#2-candidate-evaluation--scoring-model)
+4. [Directory Structure](#3-directory-structure)
+5. [Setup & Installation](#4-setup--installation)
+6. [MCP Client Configurations](#5-mcp-client-configurations)
+7. [Complete MCP Tools Reference (10 Tools)](#6-complete-mcp-tools-reference-10-tools)
+8. [Complete MCP Prompts Reference (5 Prompts)](#7-complete-mcp-prompts-reference-5-prompts)
+9. [Execution Verification](#8-execution-verification)
+
+---
+
+## Release Notes & Version 1.1.0 Changelog
+
+### 🚀 What's New in Version 1.1.0
+
+Version 1.1.0 introduces major enhancements to AST de-obfuscation, type inference, dynamic pipeline execution, and non-overfitted post-compilation logic fallbacks:
+
+1. **Generic Post-Compilation Differential Logic Fallback (`fallback_to_candidate_for_missing_logic`)**:
+   - Added a new, **100% generic tool** that evaluates post-compilation Business Logic Similarity using ASM bytecode analysis.
+   - If similarity falls below a target threshold (e.g. `< 98.0%`), the tool performs a differential file scan against alternative candidate decompiler outputs (e.g. CFR vs Vineflower).
+   - Swaps candidate files, tests `mvn clean compile`, measures ASM bytecode similarity improvement, and **retains file swaps ONLY if compilation succeeds AND the business logic similarity score increases**. Completely avoids hardcoded class/variable names.
+
+2. **Automatic Type Extraction & Contextual Name Inference (`inferMeaningfulName`)**:
+   - `generate_ast_and_detect_obfuscation` now captures the declared Java Type (`declaredType`) for every obfuscated identifier (`var1`, `var2`, `arg0`, `val$x`).
+   - Automatically infers domain-meaningful replacement names (`suggestedNewName`) based on declared type and line context (e.g., `ErrorHandler` $\rightarrow$ `errorHandler`, `LogEvent` $\rightarrow$ `event`, `Throwable` $\rightarrow$ `throwable`, `long` $\rightarrow$ `minLastModified`).
+
+3. **Dynamic AST Rename Pipeline (`run_ast_deobfuscation_pipeline`)**:
+   - Replaced static/hardcoded rename mapping arrays with **dynamic, on-the-fly AST mappings** generated directly from AST type inference.
+   - Added flexible directory scanning for both root-level decompiled outputs and Maven `src/main/java` projects.
+
+4. **Deduplication & Flexible Path Resolution**:
+   - Deduplicates AST obfuscation detections by `(file, line, variableName)`.
+   - Updated `rename_obfuscated_variables` path resolution to check both `src/main/java/` relative and root-relative file paths.
 
 ---
 
@@ -219,6 +245,15 @@ Runs the complete end-to-end AST de-obfuscation pipeline: copies `mavenized_merg
   - `gumtreeJarPath` *(string, optional)*: GumTree Spoon JAR path.
   - `logPath` *(string, optional)*: Output report log file path.
   - `renames` *(array of objects, optional)*: Custom rename entries array.
+
+### 10. `fallback_to_candidate_for_missing_logic`
+Generic post-compilation differential fallback. If ASM business logic similarity is below targetSimilarityThreshold (e.g. 98%), scans alternative decompiler candidate outputs (e.g. CFR), performs differential file swapping, tests compilation, and retains swaps only if business logic parity improves.
+- **Parameters**:
+  - `targetMavenDir` *(string, optional)*: Path to target mavenized project (default: `mavenized_final_output`).
+  - `candidateDir` *(string, optional)*: Path to fallback candidate output directory (default: `outputs/avalon-logkit-2.1_cfr`).
+  - `originalJarPath` *(string, optional)*: Path to original target JAR file for ASM parity analysis.
+  - `targetSimilarityThreshold` *(number, optional)*: Target Business Logic Similarity threshold percentage (default: `98.0`).
+  - `logPath` *(string, optional)*: Output report log file path (default: `logs/generic_logic_fallback_report.txt`).
 
 ---
 

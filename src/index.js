@@ -20,14 +20,15 @@ import {
   compareBytecodeAndAnalyze,
   generateAstAndDetectObfuscation,
   renameObfuscatedVariables,
-  runAstDeobfuscationPipeline
+  runAstDeobfuscationPipeline,
+  fallbackToCandidateForMissingLogic
 } from './decompilerHandler.js';
 
 // Create server instance with tools and prompts capabilities
 const server = new Server(
   {
     name: 'jar-decompiler-mcp-server',
-    version: '1.0.0',
+    version: '1.1.0',
   },
   {
     capabilities: {
@@ -257,6 +258,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === 'run_ast_deobfuscation_pipeline') {
       const { sourceDir, targetDir, gumtreeJarPath, logPath, renames } = args || {};
       const result = await runAstDeobfuscationPipeline({ sourceDir, targetDir, gumtreeJarPath, logPath, renames });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2)
+          }
+        ]
+      };
+    }
+
+    if (name === 'fallback_to_candidate_for_missing_logic') {
+      const { targetMavenDir, candidateDir, originalJarPath, targetSimilarityThreshold, logPath } = args || {};
+      const result = await fallbackToCandidateForMissingLogic({ targetMavenDir, candidateDir, originalJarPath, targetSimilarityThreshold, logPath });
       return {
         content: [
           {
