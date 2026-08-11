@@ -1,6 +1,6 @@
 {
   "name": "jar-decompiler-mcp-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Model Context Protocol (MCP) Server for Java JAR Decompilation, Multi-Engine Benchmark, AST Analysis, Obfuscation Renaming, and ASM Bytecode Evaluation",
   "main": "index.js",
   "bin": {

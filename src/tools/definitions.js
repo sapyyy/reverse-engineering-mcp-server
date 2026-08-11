@@ -230,5 +230,34 @@ export const TOOLS = [
         }
       }
     }
+  },
+  {
+    name: 'fallback_to_candidate_for_missing_logic',
+    description: 'Generic post-compilation differential fallback. If ASM business logic similarity is below targetSimilarityThreshold (e.g. 98%), scans alternative decompiler outputs (e.g. CFR), performs differential file swapping, tests compilation, and retains swaps only if business logic parity improves.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        targetMavenDir: {
+          type: 'string',
+          description: 'Path to target mavenized project directory. Defaults to mavenized_final_output.'
+        },
+        candidateDir: {
+          type: 'string',
+          description: 'Path to fallback decompiler candidate output directory. Defaults to outputs/avalon-logkit-2.1_cfr.'
+        },
+        originalJarPath: {
+          type: 'string',
+          description: 'Path to original target JAR file for ASM parity analysis. Defaults to targeted-jars/avalon-logkit-2.1.jar.'
+        },
+        targetSimilarityThreshold: {
+          type: 'number',
+          description: 'Target Business Logic Similarity threshold percentage (e.g. 98.0). Fallback triggers if current similarity is below this value.'
+        },
+        logPath: {
+          type: 'string',
+          description: 'Path to output the differential fallback report log. Defaults to logs/generic_logic_fallback_report.txt.'
+        }
+      }
+    }
   }
 ];
