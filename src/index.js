@@ -11,6 +11,7 @@ import {
 
 import { TOOLS } from './tools/definitions.js';
 import { PROMPTS, getPromptContent } from './prompts/definitions.js';
+import { SERVER_NAME, SERVER_VERSION } from './config.js';
 import {
   decompileJar,
   listAvailableDecompilers,
@@ -27,8 +28,8 @@ import {
 // Create server instance with tools and prompts capabilities
 const server = new Server(
   {
-    name: 'jar-decompiler-mcp-server',
-    version: '1.1.0',
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
   },
   {
     capabilities: {

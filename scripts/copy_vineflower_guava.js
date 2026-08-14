@@ -1,10 +1,18 @@
 import fs from 'fs';
 import path from 'path';
-import { compileMavenizedProject } from './decompilerHandler.js';
+import { fileURLToPath } from 'url';
 
-const sourceDir = 'C:\\Users\\ghosh\\OneDrive\\Desktop\\Decompilation\\outputs\\guava-vineflower';
-const targetDir = 'C:\\Users\\ghosh\\OneDrive\\Desktop\\Decompilation\\mavenized_merged_source';
-const logPath = 'C:\\Users\\ghosh\\OneDrive\\Desktop\\Decompilation\\logs\\merged_source_errors_log.txt';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+import { compileMavenizedProject } from '../src/decompilerHandler.js';
+import { generatePomXml } from '../src/config.js';
+
+// Parse command-line arguments with defaults
+const args = process.argv.slice(2);
+const sourceDir = args[0] || path.resolve(__dirname, '..', 'outputs', 'guava-vineflower');
+const targetDir = args[1] || path.resolve(__dirname, '..', 'mavenized_merged_source');
+const logPath = args[2] || path.resolve(__dirname, '..', 'logs', 'merged_source_errors_log.txt');
 
 function copyRecursiveSync(src, dest) {
   const exists = fs.existsSync(src);
@@ -27,6 +35,10 @@ function copyRecursiveSync(src, dest) {
 }
 
 async function main() {
+  console.log('Source:', sourceDir);
+  console.log('Target:', targetDir);
+  console.log('Log:', logPath);
+
   console.log('1. Clearing target directory:', targetDir);
   if (fs.existsSync(targetDir)) {
     fs.readdirSync(targetDir).forEach((file) => {
@@ -47,52 +59,13 @@ async function main() {
     copyRecursiveSync(path.join(sourceDir, 'META-INF'), path.join(targetResourcesDir, 'META-INF'));
   }
 
-  const pomContent = `<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-
-    <groupId>com.google.guava</groupId>
-    <artifactId>guava</artifactId>
-    <version>21.0</version>
-    <name>guava</name>
-    <description>Decompiled and Mavenized codebase for guava</description>
-
-    <properties>
-        <maven.compiler.source>1.8</maven.compiler.source>
-        <maven.compiler.target>1.8</maven.compiler.target>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    </properties>
-
-    <dependencies>
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter-api</artifactId>
-            <version>5.10.0</version>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.11.0</version>
-                <configuration>
-                    <source>1.8</source>
-                    <target>1.8</target>
-                    <compilerArgs>
-                        <arg>-g</arg>
-                        <arg>-parameters</arg>
-                    </compilerArgs>
-                </configuration>
-            </plugin>
-        </plugins>
-    </build>
-</project>
-`;
+  const pomContent = generatePomXml({
+    groupId: 'com.google.guava',
+    artifactId: 'guava',
+    version: '21.0',
+    javaVersion: '1.8',
+    compilerArgs: ['-g', '-parameters']
+  });
 
   fs.writeFileSync(path.join(targetDir, 'pom.xml'), pomContent, 'utf8');
 

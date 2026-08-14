@@ -2,6 +2,8 @@
  * MCP Prompt Declarations for JAR Decompiler MCP Server
  */
 
+import { DIRS, LOG_PATHS, LIBRARY_JARS } from '../config.js';
+
 export const PROMPTS = [
   {
     name: 'evaluate_and_mavenize_prompt',
@@ -102,8 +104,8 @@ export const PROMPTS = [
 
 export function getPromptContent(name, args) {
   if (name === 'evaluate_and_mavenize_prompt') {
-    const outputsDir = args?.outputsDir || 'outputs/';
-    const targetMavenDir = args?.targetMavenDir || 'mavenized_merged_source/';
+    const outputsDir = args?.outputsDir || DIRS.OUTPUTS + '/';
+    const targetMavenDir = args?.targetMavenDir || DIRS.MAVENIZED_MERGED_SOURCE + '/';
 
     return {
       description: 'System prompt for AST evaluation, code loss analysis, and Maven project structuring',
@@ -127,8 +129,8 @@ Your task:
   }
 
   if (name === 'fix_compilation_errors_prompt') {
-    const logFile = args?.logFile || 'logs/merged_source_errors_log.txt';
-    const projectDir = args?.projectDir || 'mavenized_merged_source';
+    const logFile = args?.logFile || LOG_PATHS.MERGED_SOURCE_ERRORS;
+    const projectDir = args?.projectDir || DIRS.MAVENIZED_MERGED_SOURCE;
 
     return {
       description: 'Strict System Rules for Repairing Java Compilation Errors Without Business Logic Alteration',
@@ -151,9 +153,9 @@ STRICT RULES & CONSTRAINTS:
   }
 
   if (name === 'compare_bytecode_prompt') {
-    const originalJarPath = args?.originalJarPath || 'targeted-jars/commons-io-2.22.0.jar';
-    const mavenDir = args?.mavenDir || 'mavenized_merged_source';
-    const logPath = args?.logPath || 'logs/bytecode_comparision.txt';
+    const originalJarPath = args?.originalJarPath;
+    const mavenDir = args?.mavenDir || DIRS.MAVENIZED_MERGED_SOURCE;
+    const logPath = args?.logPath || LOG_PATHS.BYTECODE_COMPARISON;
 
     return {
       description: 'System Instructions for ASM Bytecode Comparison and Functional Equivalence Metrics',
@@ -176,9 +178,9 @@ Your task:
   }
 
   if (name === 'rename_obfuscated_variables_prompt' || name === 'ast_deobfuscation_pipeline_prompt') {
-    const sourceDir = args?.sourceDir || 'mavenized_merged_source';
-    const targetDir = args?.targetDir || 'mavenized_final_output';
-    const logPath = args?.logPath || 'logs/ast_renamed_variables_methods.txt';
+    const sourceDir = args?.sourceDir || DIRS.MAVENIZED_MERGED_SOURCE;
+    const targetDir = args?.targetDir || DIRS.MAVENIZED_FINAL_OUTPUT;
+    const logPath = args?.logPath || LOG_PATHS.AST_RENAMED_VARIABLES;
 
     return {
       description: 'System Instructions for AST-Based Obfuscated Variable Detection, Renaming, and Pipeline Verification',

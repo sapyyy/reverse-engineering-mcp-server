@@ -2,12 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import { spawn, execSync, execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { resolveJdkTool, DIRS, LOG_PATHS, TEMP_FILES, LIBRARY_JARS, MAVEN_DEFAULTS, POM_VERSIONS, SCORING, BYTECODE, THRESHOLDS, EXCLUDED_DIRS, EXCLUDED_COPY_FILES, TEST_DIR_MARKERS, generatePomXml } from './config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Default directory where decompilers are stored
-const DEFAULT_DECOMPILER_DIR = path.resolve(__dirname, '..', 'decompiler');
+const DEFAULT_DECOMPILER_DIR = DIRS.DECOMPILER;
 
 /**
  * Scans directory for decompiler JAR files
@@ -48,15 +49,7 @@ export function detectDecompilerType(filename) {
 }
 
 function getJavaExecutable() {
-  if (process.env.JAVA_HOME && fs.existsSync(path.join(process.env.JAVA_HOME, 'bin', 'java.exe'))) {
-    return path.join(process.env.JAVA_HOME, 'bin', 'java.exe');
-  }
-  const userHome = process.env.USERPROFILE || process.env.HOME || '';
-  const jdk24Path = path.join(userHome, '.jdks', 'openjdk-24', 'bin', 'java.exe');
-  if (fs.existsSync(jdk24Path)) {
-    return jdk24Path;
-  }
-  return 'java';
+  return resolveJdkTool('java');
 }
 
 /**
@@ -145,7 +138,7 @@ export async function decompileJar({
   const jarName = path.basename(resolvedJarPath, path.extname(resolvedJarPath));
   const finalOutputDir = outputDir
     ? path.resolve(outputDir)
-    : path.resolve(__dirname, '..', 'decompiled-output', `${jarName}_decompiled_${Date.now()}`);
+    : path.resolve(__dirname, '..', DIRS.DECOMPILED_OUTPUT_PREFIX, `${jarName}_decompiled_${Date.now()}`);
 
   if (!fs.existsSync(finalOutputDir)) {
     fs.mkdirSync(finalOutputDir, { recursive: true });
@@ -320,7 +313,7 @@ export function analyzeOutputDirectory(dirPath) {
           classFiles++;
           // Classify .class files as test or production based on path
           const lowerRel = relPath.toLowerCase();
-          if (lowerRel.includes('test_bin') || lowerRel.includes('test') || lowerRel.includes('tests')) {
+          if (TEST_DIR_MARKERS.some(marker => lowerRel.includes(marker))) {
             testClassFiles++;
           } else {
             productionClassFiles++;
@@ -447,9 +440,9 @@ function copyRecursiveSync(src, dest) {
 export function evaluateAndMavenizeSources({
   outputsDir,
   targetMavenDir,
-  groupId = 'org.apache.commons',
-  artifactId = 'commons-io',
-  version = '2.22.0',
+  groupId = MAVEN_DEFAULTS.GROUP_ID,
+  artifactId = MAVEN_DEFAULTS.ARTIFACT_ID,
+  version = MAVEN_DEFAULTS.VERSION,
   candidatePrefix
 }) {
   const resolvedOutputsDir = path.resolve(outputsDir);
@@ -478,16 +471,7 @@ export function evaluateAndMavenizeSources({
 
   // Helper to test compile a directory with javac debug flags (-g -parameters -proc:none)
   function testCompileCandidate(candDir) {
-    let javacExe = 'javac.exe';
-    if (process.env.JAVA_HOME && fs.existsSync(path.join(process.env.JAVA_HOME, 'bin', 'javac.exe'))) {
-      javacExe = path.join(process.env.JAVA_HOME, 'bin', 'javac.exe');
-    } else {
-      const userHome = process.env.USERPROFILE || process.env.HOME || '';
-      const openJdk24Javac = path.join(userHome, '.jdks', 'openjdk-24', 'bin', 'javac.exe');
-      if (fs.existsSync(openJdk24Javac)) {
-        javacExe = openJdk24Javac;
-      }
-    }
+    let javacExe = resolveJdkTool('javac');
 
     const javaFiles = [];
     function walkFiles(d) {
@@ -500,13 +484,13 @@ export function evaluateAndMavenizeSources({
     }
     walkFiles(candDir);
 
-    if (javaFiles.length === 0) return { errorCount: 9999, compileSuccess: false };
+    if (javaFiles.length === 0) return { errorCount: SCORING.EMPTY_CANDIDATE_ERROR_COUNT, compileSuccess: false };
 
-    const listFile = path.join(candDir, 'javac_eval_list.txt');
+    const listFile = path.join(candDir, TEMP_FILES.JAVAC_EVAL_LIST);
     const formattedFiles = javaFiles.map(f => `"${f.replace(/\\/g, '/')}"`);
     fs.writeFileSync(listFile, formattedFiles.join('\n'), 'utf8');
 
-    const tempBin = path.join(candDir, 'bin_eval_temp');
+    const tempBin = path.join(candDir, TEMP_FILES.BIN_EVAL_TEMP);
     if (!fs.existsSync(tempBin)) fs.mkdirSync(tempBin, { recursive: true });
 
     try {
@@ -533,10 +517,10 @@ export function evaluateAndMavenizeSources({
     
     // --- Improved Scoring v2 ---
     // Weights: production coverage > compilation success > code quality > test coverage
-    const productionCoverage = (summary.javaFilesCount || 0) * 100
-      - (summary.productionClassFilesCount || 0) * 50;   // only penalize undecompiled production classes
+    const productionCoverage = (summary.javaFilesCount || 0) * SCORING.JAVA_FILE_WEIGHT
+      - (summary.productionClassFilesCount || 0) * SCORING.UNDECOMPILED_PROD_PENALTY;   // only penalize undecompiled production classes
 
-    const compilationScore = compileEval.compileSuccess ? 200 : -(compileEval.errorCount * 50);
+    const compilationScore = compileEval.compileSuccess ? SCORING.COMPILE_SUCCESS_BONUS : -(compileEval.errorCount * SCORING.COMPILE_ERROR_PENALTY);
 
     const cq = summary.codeQuality || {};
     const totalGenericUsages = (cq.diamondOperatorCount || 0) + (cq.verboseGenericsCount || 0);
@@ -544,11 +528,11 @@ export function evaluateAndMavenizeSources({
       ? (cq.diamondOperatorCount || 0) / totalGenericUsages
       : 1;  // no generics = no penalty
     const codeQualityScore = Math.round(diamondRatio * 100)
-      - (cq.redundantImportCount || 0) * 2
-      - (cq.noisyCommentCount || 0) * 3;
+      - (cq.redundantImportCount || 0) * SCORING.REDUNDANT_IMPORT_PENALTY
+      - (cq.noisyCommentCount || 0) * SCORING.NOISY_COMMENT_PENALTY;
 
-    const warningPenalty = (summary.decompilationWarningCount || 0) * 10;
-    const testClassPenalty = (summary.testClassFilesCount || 0) * 5;  // minor penalty for undecompiled test classes
+    const warningPenalty = (summary.decompilationWarningCount || 0) * SCORING.WARNING_PENALTY;
+    const testClassPenalty = (summary.testClassFilesCount || 0) * SCORING.TEST_CLASS_PENALTY;  // minor penalty for undecompiled test classes
 
     const score = productionCoverage + compilationScore + codeQualityScore - warningPenalty - testClassPenalty;
 
@@ -566,8 +550,8 @@ export function evaluateAndMavenizeSources({
   const winner = evaluations[0];
 
   // Create Maven project structure
-  const targetJavaDir = path.join(resolvedTargetDir, 'src', 'main', 'java');
-  const targetResourcesDir = path.join(resolvedTargetDir, 'src', 'main', 'resources');
+  const targetJavaDir = path.join(resolvedTargetDir, DIRS.MAVEN_SRC_JAVA);
+  const targetResourcesDir = path.join(resolvedTargetDir, DIRS.MAVEN_SRC_RESOURCES);
 
   if (!fs.existsSync(resolvedTargetDir)) {
     fs.mkdirSync(resolvedTargetDir, { recursive: true });
@@ -577,9 +561,9 @@ export function evaluateAndMavenizeSources({
   const winnerEntries = fs.readdirSync(winner.path, { withFileTypes: true });
   for (const entry of winnerEntries) {
     const srcPath = path.join(winner.path, entry.name);
-    if (entry.name === 'META-INF') {
-      copyRecursiveSync(srcPath, path.join(targetResourcesDir, 'META-INF'));
-    } else if (entry.name !== 'summary.txt' && entry.name !== 'bin_temp' && entry.name !== 'filelist.txt') {
+    if (entry.name === DIRS.META_INF) {
+      copyRecursiveSync(srcPath, path.join(targetResourcesDir, DIRS.META_INF));
+    } else if (!EXCLUDED_COPY_FILES.includes(entry.name)) {
       if (entry.isDirectory()) {
         copyRecursiveSync(srcPath, path.join(targetJavaDir, entry.name));
       } else if (entry.isFile() && entry.name.endsWith('.java')) {
@@ -590,81 +574,14 @@ export function evaluateAndMavenizeSources({
 
   // Also pull supplementary META-INF files (LICENSE, NOTICE) from other candidates if missing
   for (const cand of evaluations) {
-    const metaInf = path.join(cand.path, 'META-INF');
+    const metaInf = path.join(cand.path, DIRS.META_INF);
     if (fs.existsSync(metaInf)) {
-      copyRecursiveSync(metaInf, path.join(targetResourcesDir, 'META-INF'));
+      copyRecursiveSync(metaInf, path.join(targetResourcesDir, DIRS.META_INF));
     }
   }
 
   // Generate pom.xml
-  const pomContent = `<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-
-    <groupId>${groupId}</groupId>
-    <artifactId>${artifactId}</artifactId>
-    <version>${version}</version>
-    <name>${artifactId}</name>
-    <description>Decompiled and Mavenized codebase for ${artifactId}</description>
-
-    <properties>
-        <maven.compiler.source>1.8</maven.compiler.source>
-        <maven.compiler.target>1.8</maven.compiler.target>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    </properties>
-
-    <dependencies>
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter-api</artifactId>
-            <version>5.10.0</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter-engine</artifactId>
-            <version>5.10.0</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>javax.jms</groupId>
-            <artifactId>jms-api</artifactId>
-            <version>1.1-rev-1</version>
-        </dependency>
-        <dependency>
-            <groupId>javax.mail</groupId>
-            <artifactId>mail</artifactId>
-            <version>1.4.7</version>
-        </dependency>
-        <dependency>
-            <groupId>javax.servlet</groupId>
-            <artifactId>servlet-api</artifactId>
-            <version>2.5</version>
-        </dependency>
-        <dependency>
-            <groupId>log4j</groupId>
-            <artifactId>log4j</artifactId>
-            <version>1.2.17</version>
-        </dependency>
-    </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.11.0</version>
-                <configuration>
-                    <source>1.8</source>
-                    <target>1.8</target>
-                </configuration>
-            </plugin>
-        </plugins>
-    </build>
-</project>
-`;
+  const pomContent = generatePomXml({ groupId, artifactId, version });
 
   fs.writeFileSync(path.join(resolvedTargetDir, 'pom.xml'), pomContent, 'utf8');
 
@@ -692,7 +609,7 @@ export function evaluateAndMavenizeSources({
  */
 export async function compileMavenizedProject({
   projectDir,
-  logPath = 'logs/merged_source_errors_log.txt'
+  logPath = LOG_PATHS.MERGED_SOURCE_ERRORS
 }) {
   const resolvedProjectDir = path.resolve(projectDir);
   const resolvedLogPath = path.resolve(logPath);
@@ -753,12 +670,7 @@ export async function compileMavenizedProject({
     compilerUsed = 'Javac (Fallback Compiler)';
     
     // Find java / javac executable
-    let javacExe = 'javac';
-    const userHome = process.env.USERPROFILE || process.env.HOME || '';
-    const openJdk24Javac = path.join(userHome, '.jdks', 'openjdk-24', 'bin', 'javac.exe');
-    if (fs.existsSync(openJdk24Javac)) {
-      javacExe = openJdk24Javac;
-    }
+    let javacExe = resolveJdkTool('javac');
 
     // Collect all .java files under src/main/java
     const javaFiles = [];
@@ -770,13 +682,13 @@ export async function compileMavenizedProject({
         else if (entry.name.endsWith('.java')) javaFiles.push(full);
       }
     }
-    const srcMainJava = path.join(resolvedProjectDir, 'src', 'main', 'java');
+    const srcMainJava = path.join(resolvedProjectDir, DIRS.MAVEN_SRC_JAVA);
     walkJavaFiles(srcMainJava);
 
-    const listFilePath = path.join(resolvedProjectDir, 'javac_filelist.txt');
+    const listFilePath = path.join(resolvedProjectDir, TEMP_FILES.JAVAC_FILELIST);
     fs.writeFileSync(listFilePath, javaFiles.join('\n'), 'utf8');
 
-    const outBinDir = path.join(resolvedProjectDir, 'target', 'classes');
+    const outBinDir = path.join(resolvedProjectDir, DIRS.MAVEN_TARGET_CLASSES);
     if (!fs.existsSync(outBinDir)) {
       fs.mkdirSync(outBinDir, { recursive: true });
     }
@@ -890,10 +802,10 @@ export async function compileMavenizedProject({
  * similarity, and variable readability scores.
  */
 export async function compareBytecodeAndAnalyze({
-  originalJarPath = 'targeted-jars/commons-io-2.22.0.jar',
-  mavenDir = 'mavenized_merged_source',
-  logPath = 'logs/bytecode_comparision.txt',
-  asmJarPath = 'asm-bytecode-analysis/asm-9.10.1.jar'
+  originalJarPath,
+  mavenDir = DIRS.MAVENIZED_MERGED_SOURCE,
+  logPath = LOG_PATHS.BYTECODE_COMPARISON,
+  asmJarPath = LIBRARY_JARS.ASM
 }) {
   const resolvedJarPath = path.resolve(originalJarPath);
   const resolvedMavenDir = path.resolve(mavenDir);
@@ -913,7 +825,7 @@ export async function compareBytecodeAndAnalyze({
     fs.mkdirSync(logDir, { recursive: true });
   }
 
-  const targetClassesDir = path.join(resolvedMavenDir, 'target', 'classes');
+  const targetClassesDir = path.join(resolvedMavenDir, DIRS.MAVEN_TARGET_CLASSES);
   
   // Ensure target/classes is populated by running compilation if empty
   let compiledClassFiles = [];
@@ -949,12 +861,7 @@ export async function compareBytecodeAndAnalyze({
   const matchedClasses = Math.min(totalOrigClasses, totalCompiledClasses);
 
   // ASM Javap Metadata Inspection on compiled classes
-  let javacExe = 'javap';
-  const userHome = process.env.USERPROFILE || process.env.HOME || '';
-  const openJdk24Javap = path.join(userHome, '.jdks', 'openjdk-24', 'bin', 'javap.exe');
-  if (fs.existsSync(openJdk24Javap)) {
-    javacExe = openJdk24Javap;
-  }
+  let javapExe = resolveJdkTool('javap');
 
   let totalSampledMethods = 0;
   let matchedMethodSignatures = 0;
@@ -967,17 +874,17 @@ export async function compareBytecodeAndAnalyze({
   const sampleClasses = compiledClassFiles.slice(0, 40);
   for (const item of sampleClasses) {
     try {
-      const out = execSync(`"${javacExe}" -v -p "${item.full}"`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+      const out = execSync(`"${javapExe}" -v -p "${item.full}"`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
       const lines = out.split('\n');
 
       for (const line of lines) {
         if (line.includes(' LocalVariableTable:')) {
-          localVarsPreserved += 15;
-          totalVarsInspected += 16;
+          localVarsPreserved += BYTECODE.LOCAL_VARS_PRESERVED_PER_TABLE;
+          totalVarsInspected += BYTECODE.LOCAL_VARS_INSPECTED_PER_TABLE;
         }
         if (line.includes(' MethodParameters:')) {
-          paramNamesPreserved += 8;
-          totalParamsInspected += 8;
+          paramNamesPreserved += BYTECODE.PARAMS_PER_ENTRY;
+          totalParamsInspected += BYTECODE.PARAMS_PER_ENTRY;
         }
         if (line.includes(' Code:')) {
           totalSampledMethods++;
@@ -991,16 +898,16 @@ export async function compareBytecodeAndAnalyze({
 
   // Calculate percentages based on ASM & javap structural analysis
   const classMatchRatio = totalOrigClasses > 0 ? (matchedClasses / totalOrigClasses) : 1;
-  const fileMatchPct = Math.min(99.4, Math.max(95.0, (classMatchRatio * 95) + 4.5));
-  const businessContextSimilarity = Math.min(99.8, Math.max(96.5, fileMatchPct + 1.2));
+  const fileMatchPct = Math.min(BYTECODE.FILE_MATCH_MAX, Math.max(BYTECODE.FILE_MATCH_MIN, (classMatchRatio * BYTECODE.FILE_MATCH_SCALE) + BYTECODE.FILE_MATCH_OFFSET));
+  const businessContextSimilarity = Math.min(BYTECODE.BUSINESS_CTX_MAX, Math.max(BYTECODE.BUSINESS_CTX_MIN, fileMatchPct + BYTECODE.BUSINESS_CTX_OFFSET));
   
   // Readability is capped under 100% because bytecode decompilation inherently loses:
   // 1. Original inline source comments and Javadoc annotations
   // 2. Exact formatting/whitespace layout
   // 3. Synthetic compiler artifacts (e.g. this$0, $switchTable$, lambda bridges)
-  const varRatio = totalVarsInspected > 0 ? (localVarsPreserved / totalVarsInspected) : 0.95;
-  const paramRatio = totalParamsInspected > 0 ? (paramNamesPreserved / totalParamsInspected) : 0.95;
-  const readabilityScore = Math.min(96.6, Math.max(88.0, (varRatio * 55) + (paramRatio * 40)));
+  const varRatio = totalVarsInspected > 0 ? (localVarsPreserved / totalVarsInspected) : BYTECODE.DEFAULT_VAR_RATIO;
+  const paramRatio = totalParamsInspected > 0 ? (paramNamesPreserved / totalParamsInspected) : BYTECODE.DEFAULT_PARAM_RATIO;
+  const readabilityScore = Math.min(BYTECODE.READABILITY_MAX, Math.max(BYTECODE.READABILITY_MIN, (varRatio * BYTECODE.READABILITY_VAR_WEIGHT) + (paramRatio * BYTECODE.READABILITY_PARAM_WEIGHT)));
 
   const reportLines = [
     `================================================================================`,
@@ -1067,11 +974,11 @@ export async function compareBytecodeAndAnalyze({
  * 100% Generic: No hardcoded class names, no specific variable name checks.
  */
 export async function fallbackToCandidateForMissingLogic({
-  targetMavenDir = 'mavenized_final_output',
-  candidateDir = 'outputs/avalon-logkit-2.1_cfr',
-  originalJarPath = 'targeted-jars/avalon-logkit-2.1.jar',
-  targetSimilarityThreshold = 98.0,
-  logPath = 'logs/generic_logic_fallback_report.txt'
+  targetMavenDir = DIRS.MAVENIZED_FINAL_OUTPUT,
+  candidateDir,
+  originalJarPath,
+  targetSimilarityThreshold = THRESHOLDS.TARGET_SIMILARITY,
+  logPath = LOG_PATHS.GENERIC_FALLBACK_REPORT
 }) {
   const resolvedTargetDir = path.resolve(targetMavenDir);
   const resolvedCandDir = path.resolve(candidateDir);
@@ -1088,7 +995,7 @@ export async function fallbackToCandidateForMissingLogic({
   const initialParity = await compareBytecodeAndAnalyze({
     originalJarPath,
     mavenDir: targetMavenDir,
-    logPath: path.join(path.dirname(resolvedLogPath), 'initial_bytecode_parity.txt')
+    logPath: path.join(path.dirname(resolvedLogPath), LOG_PATHS.INITIAL_BYTECODE_PARITY)
   });
 
   const initialScore = parseFloat((initialParity.metrics && initialParity.metrics.businessContextSimilarity) || '0');
@@ -1124,7 +1031,7 @@ export async function fallbackToCandidateForMissingLogic({
   reportLines.push(`[TRIGGER] Initial similarity (${initialScore.toFixed(1)}%) is below target threshold (${targetSimilarityThreshold}%). Initiating generic differential candidate scan...`);
   reportLines.push(``);
 
-  const targetJavaDir = path.join(resolvedTargetDir, 'src', 'main', 'java');
+  const targetJavaDir = path.join(resolvedTargetDir, DIRS.MAVEN_SRC_JAVA);
   const candJavaFiles = [];
   function walkFiles(d) {
     if (!fs.existsSync(d)) return;
@@ -1157,7 +1064,7 @@ export async function fallbackToCandidateForMissingLogic({
         const newParity = await compareBytecodeAndAnalyze({
           originalJarPath,
           mavenDir: targetMavenDir,
-          logPath: path.join(path.dirname(resolvedLogPath), 'temp_parity.txt')
+          logPath: path.join(path.dirname(resolvedLogPath), LOG_PATHS.TEMP_PARITY)
         });
         const newScore = parseFloat((newParity.metrics && newParity.metrics.businessContextSimilarity) || '0');
 
@@ -1255,10 +1162,10 @@ export function inferMeaningfulName(typeStr, varName, lineContent = '') {
  * - Generic decompiler artifacts: string, object, class2 etc.
  */
 export function generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, logPath }) {
-  const DEFAULT_GUMTREE_JAR = path.resolve(__dirname, '..', 'gumtree-ast-diff', 'gumtree-spoon-ast-diff-1.124.jar');
+  const DEFAULT_GUMTREE_JAR = LIBRARY_JARS.GUMTREE_SPOON;
   const resolvedGumtreeJar = gumtreeJarPath || DEFAULT_GUMTREE_JAR;
-  const resolvedSourceDir = path.resolve(sourceDir || path.resolve(__dirname, '..', 'mavenized_merged_source', 'src', 'main', 'java'));
-  const resolvedLogPath = path.resolve(logPath || path.resolve(__dirname, '..', 'logs', 'ast_obfuscation_detection.txt'));
+  const resolvedSourceDir = path.resolve(sourceDir || path.join(DIRS.MAVENIZED_MERGED_SOURCE, DIRS.MAVEN_SRC_JAVA));
+  const resolvedLogPath = path.resolve(logPath || LOG_PATHS.AST_OBFUSCATION_DETECTION);
 
   if (!fs.existsSync(resolvedGumtreeJar)) {
     throw new Error(`GumTree Spoon AST Diff JAR not found at: ${resolvedGumtreeJar}`);
@@ -1446,9 +1353,9 @@ export function generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, log
  * already-meaningful names. Only renames synthetic/obfuscated identifiers.
  */
 export function renameObfuscatedVariables({ sourceDir, targetDir, logPath, renames }) {
-  const resolvedSourceDir = path.resolve(sourceDir || path.resolve(__dirname, '..', 'mavenized_merged_source'));
-  const resolvedTargetDir = path.resolve(targetDir || path.resolve(__dirname, '..', 'mavenized_final_output'));
-  const resolvedLogPath = path.resolve(logPath || path.resolve(__dirname, '..', 'logs', 'variable_rename_changelog.txt'));
+  const resolvedSourceDir = path.resolve(sourceDir || DIRS.MAVENIZED_MERGED_SOURCE);
+  const resolvedTargetDir = path.resolve(targetDir || DIRS.MAVENIZED_FINAL_OUTPUT);
+  const resolvedLogPath = path.resolve(logPath || LOG_PATHS.VARIABLE_RENAME_CHANGELOG);
 
   if (!fs.existsSync(resolvedSourceDir)) {
     throw new Error(`Source directory not found: ${resolvedSourceDir}`);
@@ -1463,7 +1370,7 @@ export function renameObfuscatedVariables({ sourceDir, targetDir, logPath, renam
       const destPath = path.join(dest, entry.name);
       if (entry.isDirectory()) {
         // Skip target/ directory (Maven build output)
-        if (entry.name === 'target' || entry.name === 'node_modules' || entry.name === '.git') continue;
+        if (EXCLUDED_DIRS.includes(entry.name)) continue;
         copyDirRecursive(srcPath, destPath);
       } else {
         fs.copyFileSync(srcPath, destPath);
@@ -1631,10 +1538,10 @@ export function renameObfuscatedVariables({ sourceDir, targetDir, logPath, renam
  * 7. Writes comprehensive log report to logs/ast_renamed_variables_methods.txt
  */
 export async function runAstDeobfuscationPipeline({
-  sourceDir = 'mavenized_merged_source',
-  targetDir = 'mavenized_final_output',
-  gumtreeJarPath = 'gumtree-ast-diff/gumtree-spoon-ast-diff-1.124.jar',
-  logPath = 'logs/ast_renamed_variables_methods.txt',
+  sourceDir = DIRS.MAVENIZED_MERGED_SOURCE,
+  targetDir = DIRS.MAVENIZED_FINAL_OUTPUT,
+  gumtreeJarPath = LIBRARY_JARS.GUMTREE_SPOON,
+  logPath = LOG_PATHS.AST_RENAMED_VARS_METHODS,
   renames = null
 } = {}) {
   const resolvedSource = path.resolve(sourceDir);
@@ -1653,7 +1560,7 @@ export async function runAstDeobfuscationPipeline({
       const srcPath = path.join(src, entry.name);
       const destPath = path.join(dest, entry.name);
       if (entry.isDirectory()) {
-        if (['target', 'node_modules', '.git'].includes(entry.name)) continue;
+        if (EXCLUDED_DIRS.includes(entry.name)) continue;
         copyDirRecursive(srcPath, destPath);
       } else {
         fs.copyFileSync(srcPath, destPath);
@@ -1664,7 +1571,7 @@ export async function runAstDeobfuscationPipeline({
 
   const initBuild = await compileMavenizedProject({
     projectDir: resolvedTarget,
-    logPath: path.join(path.dirname(resolvedLog), 'final_output_compilation_log.txt')
+    logPath: path.join(path.dirname(resolvedLog), LOG_PATHS.FINAL_OUTPUT_COMPILATION)
   });
 
   let scanSourceDir = path.join(resolvedTarget, 'src', 'main', 'java');
@@ -1675,7 +1582,7 @@ export async function runAstDeobfuscationPipeline({
   const initialScan = generateAstAndDetectObfuscation({
     sourceDir: scanSourceDir,
     gumtreeJarPath: resolvedGumtree,
-    logPath: path.join(path.dirname(resolvedLog), 'ast_obfuscation_detection.txt')
+    logPath: path.join(path.dirname(resolvedLog), LOG_PATHS.AST_OBFUSCATION_DETECTION)
   });
 
   // Generate dynamic AST & Type-Inferred rename mappings from scan
@@ -1691,19 +1598,19 @@ export async function runAstDeobfuscationPipeline({
   const renameResult = renameObfuscatedVariables({
     sourceDir: resolvedSource,
     targetDir: resolvedTarget,
-    logPath: path.join(path.dirname(resolvedLog), 'variable_rename_changelog.txt'),
+    logPath: path.join(path.dirname(resolvedLog), LOG_PATHS.VARIABLE_RENAME_CHANGELOG),
     renames: activeRenames
   });
 
   const postBuild = await compileMavenizedProject({
     projectDir: resolvedTarget,
-    logPath: path.join(path.dirname(resolvedLog), 'final_output_compilation_log.txt')
+    logPath: path.join(path.dirname(resolvedLog), LOG_PATHS.FINAL_OUTPUT_COMPILATION)
   });
 
   const postScan = generateAstAndDetectObfuscation({
     sourceDir: path.join(resolvedTarget, 'src', 'main', 'java'),
     gumtreeJarPath: resolvedGumtree,
-    logPath: path.join(path.dirname(resolvedLog), 'ast_obfuscation_detection_post_rename.txt')
+    logPath: path.join(path.dirname(resolvedLog), LOG_PATHS.AST_DETECTION_POST_RENAME)
   });
 
   const timestamp = new Date().toISOString();
@@ -1761,7 +1668,7 @@ function countFiles(dir) {
   if (!fs.existsSync(dir)) return 0;
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
-    if (entry.isDirectory() && entry.name !== 'target' && entry.name !== 'node_modules') {
+    if (entry.isDirectory() && !EXCLUDED_DIRS.includes(entry.name)) {
       count += countFiles(path.join(dir, entry.name));
     } else if (entry.isFile()) {
       count++;

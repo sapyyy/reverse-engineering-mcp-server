@@ -2,6 +2,8 @@
  * MCP Tool Declarations for JAR Decompiler MCP Server
  */
 
+import { DIRS, LOG_PATHS, LIBRARY_JARS, MAVEN_DEFAULTS, THRESHOLDS } from '../config.js';
+
 export const TOOLS = [
   {
     name: 'decompile_jar',
