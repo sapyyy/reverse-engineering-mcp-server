@@ -238,10 +238,18 @@ export function analyzeOutputDirectory(dirPath) {
   let totalFiles = 0;
   let javaFiles = 0;
   let classFiles = 0;
+  let productionClassFiles = 0;
+  let testClassFiles = 0;
   let resourceFiles = 0;
   let totalSizeBytes = 0;
   const warningsAndErrors = [];
   const javaFileList = [];
+
+  // Code quality metrics
+  let diamondOperatorCount = 0;       // modern <> usage
+  let verboseGenericsCount = 0;       // old-style explicit type params in constructors
+  let redundantImportCount = 0;       // same-package imports
+  let noisyCommentCount = 0;          // decompiler metadata noise
 
   function walk(currentDir, relativePath = '') {
     const entries = fs.readdirSync(currentDir, { withFileTypes: true });
@@ -261,25 +269,48 @@ export function analyzeOutputDirectory(dirPath) {
           javaFiles++;
           javaFileList.push(relPath);
 
-          // Scan first 100 lines for decompilation comments/issues
+          // Scan for decompilation comments/issues and code quality metrics
           try {
             const content = fs.readFileSync(fullPath, 'utf8');
             const lines = content.split('\n');
 
-            for (let i = 0; i < Math.min(lines.length, 150); i++) {
+            // Detect package name for redundant import analysis
+            const packageMatch = content.match(/^\s*package\s+([\w.]+)\s*;/m);
+            const packageName = packageMatch ? packageMatch[1] : '';
+
+            for (let i = 0; i < lines.length; i++) {
               const line = lines[i];
-              if (
-                line.includes('// Decompiler') ||
-                line.includes('// Could not') ||
-                line.includes('// FAILED') ||
-                line.includes('/* Synthetic */') ||
-                line.includes('// Exception decompiling')
-              ) {
-                warningsAndErrors.push({
-                  file: relPath,
-                  line: i + 1,
-                  message: line.trim()
-                });
+              // Decompilation warnings/errors (scan first 150 lines)
+              if (i < 150) {
+                if (
+                  line.includes('// Decompiler') ||
+                  line.includes('// Could not') ||
+                  line.includes('// FAILED') ||
+                  line.includes('/* Synthetic */') ||
+                  line.includes('// Exception decompiling')
+                ) {
+                  warningsAndErrors.push({
+                    file: relPath,
+                    line: i + 1,
+                    message: line.trim()
+                  });
+                }
+              }
+
+              // Code quality: diamond operator vs verbose generics
+              if (line.match(/new\s+\w+<>/)) diamondOperatorCount++;
+              if (line.match(/new\s+\w+<[A-Z]\w*/)) verboseGenericsCount++;
+
+              // Code quality: redundant same-package imports
+              if (packageName && line.match(/^\s*import\s+/) && line.includes(packageName + '.') && !line.includes('*')) {
+                redundantImportCount++;
+              }
+
+              // Code quality: noisy decompiler metadata comments
+              if (line.match(/\/\*.*class file version.*\*\//i) ||
+                  line.match(/\/\*.*Decompiled with.*\*\//i) ||
+                  line.match(/\/\/.*Decompiled with/i)) {
+                noisyCommentCount++;
               }
             }
           } catch (e) {
@@ -287,6 +318,13 @@ export function analyzeOutputDirectory(dirPath) {
           }
         } else if (entry.name.endsWith('.class')) {
           classFiles++;
+          // Classify .class files as test or production based on path
+          const lowerRel = relPath.toLowerCase();
+          if (lowerRel.includes('test_bin') || lowerRel.includes('test') || lowerRel.includes('tests')) {
+            testClassFiles++;
+          } else {
+            productionClassFiles++;
+          }
         } else {
           resourceFiles++;
         }
@@ -304,10 +342,18 @@ export function analyzeOutputDirectory(dirPath) {
       totalFiles,
       javaFilesCount: javaFiles,
       remainingClassFilesCount: classFiles,
+      productionClassFilesCount: productionClassFiles,
+      testClassFilesCount: testClassFiles,
       resourceFilesCount: resourceFiles,
       totalSizeFormatted: formatBytes(totalSizeBytes),
       totalSizeBytes,
-      decompilationWarningCount: warningsAndErrors.length
+      decompilationWarningCount: warningsAndErrors.length,
+      codeQuality: {
+        diamondOperatorCount,
+        verboseGenericsCount,
+        redundantImportCount,
+        noisyCommentCount
+      }
     },
     warningsAndErrors: warningsAndErrors.slice(0, 50),
     sampleJavaFiles: javaFileList.slice(0, 20),
@@ -485,11 +531,26 @@ export function evaluateAndMavenizeSources({
     const summary = analysis.summary || {};
     const compileEval = testCompileCandidate(candDir);
     
-    // Scoring logic: higher Java count, lower compilation errors with -g -parameters, lower warning count
-    const score = (summary.javaFilesCount || 0) * 100 
-      - (compileEval.errorCount * 200)
-      - (summary.decompilationWarningCount || 0) * 10 
-      - (summary.remainingClassFilesCount || 0) * 50;
+    // --- Improved Scoring v2 ---
+    // Weights: production coverage > compilation success > code quality > test coverage
+    const productionCoverage = (summary.javaFilesCount || 0) * 100
+      - (summary.productionClassFilesCount || 0) * 50;   // only penalize undecompiled production classes
+
+    const compilationScore = compileEval.compileSuccess ? 200 : -(compileEval.errorCount * 50);
+
+    const cq = summary.codeQuality || {};
+    const totalGenericUsages = (cq.diamondOperatorCount || 0) + (cq.verboseGenericsCount || 0);
+    const diamondRatio = totalGenericUsages > 0
+      ? (cq.diamondOperatorCount || 0) / totalGenericUsages
+      : 1;  // no generics = no penalty
+    const codeQualityScore = Math.round(diamondRatio * 100)
+      - (cq.redundantImportCount || 0) * 2
+      - (cq.noisyCommentCount || 0) * 3;
+
+    const warningPenalty = (summary.decompilationWarningCount || 0) * 10;
+    const testClassPenalty = (summary.testClassFilesCount || 0) * 5;  // minor penalty for undecompiled test classes
+
+    const score = productionCoverage + compilationScore + codeQualityScore - warningPenalty - testClassPenalty;
 
     return {
       name,
@@ -614,7 +675,10 @@ export function evaluateAndMavenizeSources({
       name: e.name,
       score: e.score,
       javaFilesCount: e.analysis.summary.javaFilesCount,
+      productionClassFilesCount: e.analysis.summary.productionClassFilesCount,
+      testClassFilesCount: e.analysis.summary.testClassFilesCount,
       decompilationWarningCount: e.analysis.summary.decompilationWarningCount,
+      codeQuality: e.analysis.summary.codeQuality,
       compileEval: e.compileEval
     })),
     mavenizedDir: resolvedTargetDir,
