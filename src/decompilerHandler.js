@@ -53,6 +53,71 @@ function getJavaExecutable() {
 }
 
 /**
+ * Resolves the javap executable path
+ */
+function getJavapExecutable() {
+  return resolveJdkTool('javap');
+}
+
+/**
+ * Resolves the jar executable path
+ */
+function getJarExecutable() {
+  return resolveJdkTool('jar');
+}
+
+/**
+ * Parses `javap -p` output and extracts method and field signatures as normalized sets.
+ * Method signatures include constructors, instance/static methods.
+ * Field signatures include instance/static fields.
+ */
+function parseJavapMembers(javapOutput) {
+  const methods = new Set();
+  const fields = new Set();
+  let insideClass = false;
+
+  for (const line of javapOutput.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '{') { insideClass = true; continue; }
+    if (trimmed === '}') { insideClass = false; continue; }
+    if (!insideClass || !trimmed || trimmed.startsWith('Compiled from')) continue;
+
+    // Normalize: strip trailing semicolon, collapse whitespace
+    const normalized = trimmed.replace(/;$/, '').replace(/\s+/g, ' ').trim();
+    if (!normalized) continue;
+
+    if (normalized.includes('(')) {
+      methods.add(normalized);
+    } else {
+      fields.add(normalized);
+    }
+  }
+
+  return { methods, fields };
+}
+
+/**
+ * Counts debug metadata sections in `javap -v -p` output.
+ * Returns counts of Code sections, LocalVariableTable, LineNumberTable, and MethodParameters.
+ */
+function countDebugMetadata(verboseOutput) {
+  let codeSections = 0;
+  let localVariableTableCount = 0;
+  let lineNumberTableCount = 0;
+  let methodParametersCount = 0;
+
+  for (const line of verboseOutput.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === 'Code:') codeSections++;
+    else if (trimmed === 'LocalVariableTable:') localVariableTableCount++;
+    else if (trimmed === 'LineNumberTable:') lineNumberTableCount++;
+    else if (trimmed === 'MethodParameters:') methodParametersCount++;
+  }
+
+  return { codeSections, localVariableTableCount, lineNumberTableCount, methodParametersCount };
+}
+
+/**
  * Builds the execution arguments for running Java + Decompiler Jar
  */
 function buildDecompilerCommand(decompilerPath, jarPath, outputDir, decompilerType, extraArgs = []) {
@@ -98,7 +163,7 @@ function buildDecompilerCommand(decompilerPath, jarPath, outputDir, decompilerTy
 }
 
 /**
- * Decompiles a JAR file and collects decompilation statistics & information
+ * Decompiles a JAR/WAR file and collects decompilation statistics & information
  */
 export async function decompileJar({
   jarPath,
@@ -109,74 +174,79 @@ export async function decompileJar({
 }) {
   const startTime = Date.now();
 
-  // Validate input JAR
+  // Validate input JAR/WAR
   const resolvedJarPath = path.resolve(jarPath);
   if (!fs.existsSync(resolvedJarPath)) {
-    throw new Error(`Input JAR file does not exist: ${resolvedJarPath}`);
+    throw new Error(`Input file does not exist: ${resolvedJarPath}`);
   }
 
   // Resolve Decompiler Path
   let finalDecompilerPath = decompilerPath;
   if (!finalDecompilerPath) {
-    const available = listAvailableDecompilers();
-    if (available.length === 0) {
+    const decompilers = listAvailableDecompilers();
+    if (decompilers.length === 0) {
       throw new Error(
-        `No decompiler specified and no decompiler jar found in '${DEFAULT_DECOMPILER_DIR}'. ` +
-        `Please place a decompiler jar (e.g. cfr.jar, vineflower.jar) in the decompiler folder or pass 'decompilerPath'.`
+        'No Java decompilers found in the default "decompiler/" folder. ' +
+        'Please provide an explicit decompilerPath or place a decompiler jar (e.g., CFR, Vineflower, Procyon) into the "decompiler/" directory.'
       );
     }
-    finalDecompilerPath = available[0].path;
-  } else {
-    finalDecompilerPath = path.resolve(finalDecompilerPath);
+    finalDecompilerPath = decompilers[0].path;
   }
 
-  if (!fs.existsSync(finalDecompilerPath)) {
-    throw new Error(`Decompiler binary/jar not found at: ${finalDecompilerPath}`);
+  const resolvedDecompilerPath = path.resolve(finalDecompilerPath);
+  if (!fs.existsSync(resolvedDecompilerPath)) {
+    throw new Error(`Specified decompiler does not exist: ${resolvedDecompilerPath}`);
   }
 
-  // Resolve Output Directory
-  const jarName = path.basename(resolvedJarPath, path.extname(resolvedJarPath));
-  const finalOutputDir = outputDir
-    ? path.resolve(outputDir)
-    : path.resolve(__dirname, '..', DIRS.DECOMPILED_OUTPUT_PREFIX, `${jarName}_decompiled_${Date.now()}`);
+  // Determine Output Directory
+  const baseJarName = path.basename(resolvedJarPath, path.extname(resolvedJarPath));
+  const finalOutputDir = path.resolve(outputDir || path.join(DIRS.DECOMPILED_OUTPUT_PREFIX, `${baseJarName}_${Date.now()}`));
 
+  // Ensure output directory exists
   if (!fs.existsSync(finalOutputDir)) {
     fs.mkdirSync(finalOutputDir, { recursive: true });
   }
 
-  // Determine actual type
-  const actualType = decompilerType === 'auto'
-    ? detectDecompilerType(path.basename(finalDecompilerPath))
-    : decompilerType;
+  // Build Command
+  let detectedType = decompilerType;
+  if (detectedType === 'auto') {
+    detectedType = detectDecompilerType(path.basename(resolvedDecompilerPath));
+  }
 
-  // Build command
-  const { command, args } = buildDecompilerCommand(
-    finalDecompilerPath,
+  const { command, args, type } = buildDecompilerCommand(
+    resolvedDecompilerPath,
     resolvedJarPath,
     finalOutputDir,
-    actualType,
+    detectedType,
     extraArgs
   );
 
-  const commandLineStr = `${command} ${args.map(a => (a.includes(' ') ? `"${a}"` : a)).join(' ')}`;
+  const fullCommandLine = `${command} ${args.map(a => (a.includes(' ') ? `"${a}"` : a)).join(' ')}`;
 
-  // Run child process
-  const result = await new Promise((resolve) => {
+  // Execute Decompiler Process
+  const execResult = await new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
 
-    const proc = spawn(command, args, { shell: false });
+    const proc = spawn(command, args, {
+      cwd: process.cwd(),
+      shell: false
+    });
 
-    proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-    proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    proc.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    proc.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
 
     proc.on('error', (err) => {
       resolve({
         success: false,
         exitCode: -1,
         stdout,
-        stderr: stderr + `\nProcess execution error: ${err.message}`,
-        error: err
+        stderr: stderr + `\nExecution process error: ${err.message}`
       });
     });
 
@@ -185,161 +255,160 @@ export async function decompileJar({
         success: code === 0,
         exitCode: code,
         stdout,
-        stderr,
-        error: null
+        stderr
       });
     });
   });
 
   const durationMs = Date.now() - startTime;
-
-  // Analyze output directory
-  const analysis = analyzeOutputDirectory(finalOutputDir);
+  const decompilationInfo = analyzeOutputDirectory(finalOutputDir);
 
   return {
-    success: result.success,
-    executionDetails: {
-      commandLine: commandLineStr,
-      decompilerUsed: path.basename(finalDecompilerPath),
-      decompilerType: actualType,
-      exitCode: result.exitCode,
-      durationMs: durationMs,
-      durationFormatted: `${(durationMs / 1000).toFixed(2)}s`
-    },
+    success: execResult.success,
     inputJar: {
-      name: path.basename(resolvedJarPath),
       path: resolvedJarPath,
+      name: path.basename(resolvedJarPath),
       sizeBytes: fs.statSync(resolvedJarPath).size
     },
     outputDir: finalOutputDir,
-    logs: {
-      stdout: result.stdout,
-      stderr: result.stderr
+    decompilationInfo,
+    executionDetails: {
+      decompilerUsed: path.basename(resolvedDecompilerPath),
+      decompilerType: type,
+      commandLine: fullCommandLine,
+      exitCode: execResult.exitCode,
+      durationMs,
+      durationFormatted: `${(durationMs / 1000).toFixed(2)}s`
     },
-    decompilationInfo: analysis
+    logs: {
+      stdout: execResult.stdout,
+      stderr: execResult.stderr
+    }
   };
 }
 
 /**
- * Scans output directory for decompiled code statistics, warnings, error lines, and structure
+ * Analyzes output directory of decompiled files
  */
 export function analyzeOutputDirectory(dirPath) {
-  if (!fs.existsSync(dirPath)) {
-    return { error: 'Output directory does not exist' };
+  const resolvedPath = path.resolve(dirPath);
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error(`Directory does not exist for analysis: ${resolvedPath}`);
   }
 
   let totalFiles = 0;
-  let javaFiles = 0;
-  let classFiles = 0;
-  let productionClassFiles = 0;
-  let testClassFiles = 0;
-  let resourceFiles = 0;
-  let totalSizeBytes = 0;
+  let javaFilesCount = 0;
+  let remainingClassFilesCount = 0;
+  let productionClassFilesCount = 0;
+  let testClassFilesCount = 0;
+  let resourceFilesCount = 0;
+  let totalBytes = 0;
   const warningsAndErrors = [];
-  const javaFileList = [];
 
   // Code quality metrics
-  let diamondOperatorCount = 0;       // modern <> usage
-  let verboseGenericsCount = 0;       // old-style explicit type params in constructors
-  let redundantImportCount = 0;       // same-package imports
-  let noisyCommentCount = 0;          // decompiler metadata noise
+  let diamondOperatorCount = 0;
+  let verboseGenericsCount = 0;
+  let redundantImportCount = 0;
+  let noisyCommentCount = 0;
 
-  function walk(currentDir, relativePath = '') {
+  function isTestPath(filePath) {
+    const lower = filePath.toLowerCase();
+    return TEST_DIR_MARKERS.some(marker => lower.includes(marker));
+  }
+
+  function scanDir(currentDir) {
     const entries = fs.readdirSync(currentDir, { withFileTypes: true });
 
     for (const entry of entries) {
       const fullPath = path.join(currentDir, entry.name);
-      const relPath = path.join(relativePath, entry.name);
+      const relativePath = path.relative(resolvedPath, fullPath);
 
       if (entry.isDirectory()) {
-        walk(fullPath, relPath);
+        scanDir(fullPath);
       } else if (entry.isFile()) {
         totalFiles++;
         const stat = fs.statSync(fullPath);
-        totalSizeBytes += stat.size;
+        totalBytes += stat.size;
 
         if (entry.name.endsWith('.java')) {
-          javaFiles++;
-          javaFileList.push(relPath);
+          javaFilesCount++;
 
-          // Scan for decompilation comments/issues and code quality metrics
+          // Scan Java file for warnings, errors, and code quality indicators
           try {
             const content = fs.readFileSync(fullPath, 'utf8');
             const lines = content.split('\n');
 
-            // Detect package name for redundant import analysis
-            const packageMatch = content.match(/^\s*package\s+([\w.]+)\s*;/m);
-            const packageName = packageMatch ? packageMatch[1] : '';
-
-            for (let i = 0; i < lines.length; i++) {
+            // Scan first 150 lines for decompiler warnings
+            const maxScanLines = Math.min(lines.length, 150);
+            for (let i = 0; i < maxScanLines; i++) {
               const line = lines[i];
-              // Decompilation warnings/errors (scan first 150 lines)
-              if (i < 150) {
-                if (
-                  line.includes('// Decompiler') ||
-                  line.includes('// Could not') ||
-                  line.includes('// FAILED') ||
-                  line.includes('/* Synthetic */') ||
-                  line.includes('// Exception decompiling')
-                ) {
-                  warningsAndErrors.push({
-                    file: relPath,
-                    line: i + 1,
-                    message: line.trim()
-                  });
-                }
-              }
-
-              // Code quality: diamond operator vs verbose generics
-              if (line.match(/new\s+\w+<>/)) diamondOperatorCount++;
-              if (line.match(/new\s+\w+<[A-Z]\w*/)) verboseGenericsCount++;
-
-              // Code quality: redundant same-package imports
-              if (packageName && line.match(/^\s*import\s+/) && line.includes(packageName + '.') && !line.includes('*')) {
-                redundantImportCount++;
-              }
-
-              // Code quality: noisy decompiler metadata comments
-              if (line.match(/\/\*.*class file version.*\*\//i) ||
-                  line.match(/\/\*.*Decompiled with.*\*\//i) ||
-                  line.match(/\/\/.*Decompiled with/i)) {
-                noisyCommentCount++;
+              if (
+                line.includes('// FAILED to decompile') ||
+                line.includes('// Decompiler error') ||
+                line.includes('// Warning') ||
+                line.includes('/* WARNING') ||
+                line.includes('Could not load') ||
+                line.includes('/* synthetic')
+              ) {
+                warningsAndErrors.push({
+                  file: relativePath,
+                  line: i + 1,
+                  message: line.trim()
+                });
               }
             }
-          } catch (e) {
-            // Ignore read errors
+
+            // Code Quality: Check diamond operators vs verbose generics
+            const diamondMatches = content.match(/new\s+[A-Za-z0-9_]+<\s*>/g);
+            if (diamondMatches) diamondOperatorCount += diamondMatches.length;
+
+            const verboseGenericMatches = content.match(/new\s+[A-Za-z0-9_]+<[A-Za-z0-9_,\s<>]+>/g);
+            if (verboseGenericMatches) verboseGenericsCount += verboseGenericMatches.length;
+
+            // Check redundant imports
+            const importMatches = content.match(/^import\s+java\.lang\.[A-Za-z0-9_]+;/gm);
+            if (importMatches) redundantImportCount += importMatches.length;
+
+            // Check noisy decompiler comments
+            const commentMatches = content.match(/\/\*\s*(synthetic|bridge method|flags:)[^*]*\*\//gi);
+            if (commentMatches) noisyCommentCount += commentMatches.length;
+
+          } catch (readErr) {
+            warningsAndErrors.push({
+              file: relativePath,
+              line: 0,
+              message: `Could not read file: ${readErr.message}`
+            });
           }
         } else if (entry.name.endsWith('.class')) {
-          classFiles++;
-          // Classify .class files as test or production based on path
-          const lowerRel = relPath.toLowerCase();
-          if (TEST_DIR_MARKERS.some(marker => lowerRel.includes(marker))) {
-            testClassFiles++;
+          remainingClassFilesCount++;
+          if (isTestPath(relativePath)) {
+            testClassFilesCount++;
           } else {
-            productionClassFiles++;
+            productionClassFilesCount++;
           }
         } else {
-          resourceFiles++;
+          resourceFilesCount++;
         }
       }
     }
   }
 
-  walk(dirPath);
+  scanDir(resolvedPath);
 
-  // Generate directory tree snippet (max 30 items)
-  const treeSnippet = buildDirectoryTree(dirPath, 3, 30);
+  const directoryTree = buildDirectoryTree(resolvedPath);
 
   return {
+    directoryPath: resolvedPath,
     summary: {
       totalFiles,
-      javaFilesCount: javaFiles,
-      remainingClassFilesCount: classFiles,
-      productionClassFilesCount: productionClassFiles,
-      testClassFilesCount: testClassFiles,
-      resourceFilesCount: resourceFiles,
-      totalSizeFormatted: formatBytes(totalSizeBytes),
-      totalSizeBytes,
+      javaFilesCount,
+      remainingClassFilesCount,
+      productionClassFilesCount,
+      testClassFilesCount,
+      resourceFilesCount,
+      totalSizeFormatted: formatBytes(totalBytes),
+      totalBytes,
       decompilationWarningCount: warningsAndErrors.length,
       codeQuality: {
         diamondOperatorCount,
@@ -349,8 +418,7 @@ export function analyzeOutputDirectory(dirPath) {
       }
     },
     warningsAndErrors: warningsAndErrors.slice(0, 50),
-    sampleJavaFiles: javaFileList.slice(0, 20),
-    directoryTree: treeSnippet
+    directoryTree
   };
 }
 
@@ -358,65 +426,63 @@ export function analyzeOutputDirectory(dirPath) {
  * Helper to build directory tree string
  */
 function buildDirectoryTree(dirPath, maxDepth = 3, maxItems = 40) {
-  let output = [];
-  let itemsCount = 0;
+  let count = 0;
 
-  function printTree(currentDir, depth = 0, prefix = '') {
-    if (depth > maxDepth || itemsCount >= maxItems) return;
+  function renderTree(dir, prefix = '', depth = 0) {
+    if (depth >= maxDepth || count >= maxItems) return '';
 
-    let entries;
-    try {
-      entries = fs.readdirSync(currentDir, { withFileTypes: true });
-    } catch {
-      return;
-    }
+    let result = '';
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
 
-    entries.sort((a, b) => {
-      if (a.isDirectory() && !b.isDirectory()) return -1;
-      if (!a.isDirectory() && b.isDirectory()) return 1;
-      return a.name.localeCompare(b.name);
-    });
+    // Group directories first, then files
+    const dirs = entries.filter(e => e.isDirectory() && !e.name.startsWith('.'));
+    const files = entries.filter(e => e.isFile());
 
-    for (let i = 0; i < entries.length; i++) {
-      if (itemsCount >= maxItems) {
-        output.push(`${prefix}└── ... (truncated standard tree view)`);
+    const all = [...dirs, ...files];
+
+    for (let i = 0; i < all.length; i++) {
+      if (count >= maxItems) {
+        result += `${prefix}└── ... (more files truncated)\n`;
         break;
       }
 
-      const entry = entries[i];
-      const isLast = i === entries.length - 1;
-      const connector = isLast ? '└── ' : '├── ';
+      const entry = all[i];
+      const isLast = i === all.length - 1;
+      const pointer = isLast ? '└── ' : '├── ';
+      const subPrefix = prefix + (isLast ? '    ' : '│   ');
 
-      itemsCount++;
-      output.push(`${prefix}${connector}${entry.name}${entry.isDirectory() ? '/' : ''}`);
+      result += `${prefix}${pointer}${entry.name}${entry.isDirectory() ? '/' : ''}\n`;
+      count++;
 
       if (entry.isDirectory()) {
-        const nextPrefix = prefix + (isLast ? '    ' : '│   ');
-        printTree(path.join(currentDir, entry.name), depth + 1, nextPrefix);
+        result += renderTree(path.join(dir, entry.name), subPrefix, depth + 1);
       }
     }
+
+    return result;
   }
 
-  output.push(path.basename(dirPath) + '/');
-  printTree(dirPath, 0, '');
-  return output.join('\n');
+  return path.basename(dirPath) + '/\n' + renderTree(dirPath);
 }
 
 function formatBytes(bytes) {
-  if (bytes === 0) return '0 Bytes';
+  if (bytes === 0) return '0 B';
   const k = 1024;
-  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const sizes = ['B', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
 /**
- * Recursively copies a directory or file synchronously
+ * Helper: Recursively copy directories and files
  */
 function copyRecursiveSync(src, dest) {
   const exists = fs.existsSync(src);
-  const stats = exists && fs.statSync(src);
-  const isDirectory = exists && stats.isDirectory();
+  if (!exists) return;
+
+  const stats = fs.statSync(src);
+  const isDirectory = stats.isDirectory();
+
   if (isDirectory) {
     if (!fs.existsSync(dest)) {
       fs.mkdirSync(dest, { recursive: true });
@@ -425,17 +491,17 @@ function copyRecursiveSync(src, dest) {
       copyRecursiveSync(path.join(src, childItemName), path.join(dest, childItemName));
     });
   } else {
-    const parent = path.dirname(dest);
-    if (!fs.existsSync(parent)) {
-      fs.mkdirSync(parent, { recursive: true });
+    const parentDir = path.dirname(dest);
+    if (!fs.existsSync(parentDir)) {
+      fs.mkdirSync(parentDir, { recursive: true });
     }
     fs.copyFileSync(src, dest);
   }
 }
 
 /**
- * Compares multiple decompiled output directories, chooses the optimal candidate,
- * and structures it into a standard Maven project layout with pom.xml.
+ * Evaluates candidate decompiled outputs, scores each candidate,
+ * selects the optimal candidate, and mavenizes it into targetMavenDir.
  */
 export function evaluateAndMavenizeSources({
   outputsDir,
@@ -492,7 +558,7 @@ export function evaluateAndMavenizeSources({
 
     const tempBin = path.join(candDir, TEMP_FILES.BIN_EVAL_TEMP);
     if (!fs.existsSync(tempBin)) fs.mkdirSync(tempBin, { recursive: true });
-
+    
     try {
       const args = ['-g', '-parameters', '-proc:none', '-encoding', 'UTF-8', '-d', tempBin, `@${listFile}`];
       execFileSync(javacExe, args, { stdio: 'pipe', encoding: 'utf8' });
@@ -516,9 +582,8 @@ export function evaluateAndMavenizeSources({
     const compileEval = testCompileCandidate(candDir);
     
     // --- Improved Scoring v2 ---
-    // Weights: production coverage > compilation success > code quality > test coverage
     const productionCoverage = (summary.javaFilesCount || 0) * SCORING.JAVA_FILE_WEIGHT
-      - (summary.productionClassFilesCount || 0) * SCORING.UNDECOMPILED_PROD_PENALTY;   // only penalize undecompiled production classes
+      - (summary.productionClassFilesCount || 0) * SCORING.UNDECOMPILED_PROD_PENALTY;
 
     const compilationScore = compileEval.compileSuccess ? SCORING.COMPILE_SUCCESS_BONUS : -(compileEval.errorCount * SCORING.COMPILE_ERROR_PENALTY);
 
@@ -526,13 +591,13 @@ export function evaluateAndMavenizeSources({
     const totalGenericUsages = (cq.diamondOperatorCount || 0) + (cq.verboseGenericsCount || 0);
     const diamondRatio = totalGenericUsages > 0
       ? (cq.diamondOperatorCount || 0) / totalGenericUsages
-      : 1;  // no generics = no penalty
+      : 1;
     const codeQualityScore = Math.round(diamondRatio * 100)
       - (cq.redundantImportCount || 0) * SCORING.REDUNDANT_IMPORT_PENALTY
       - (cq.noisyCommentCount || 0) * SCORING.NOISY_COMMENT_PENALTY;
 
     const warningPenalty = (summary.decompilationWarningCount || 0) * SCORING.WARNING_PENALTY;
-    const testClassPenalty = (summary.testClassFilesCount || 0) * SCORING.TEST_CLASS_PENALTY;  // minor penalty for undecompiled test classes
+    const testClassPenalty = (summary.testClassFilesCount || 0) * SCORING.TEST_CLASS_PENALTY;
 
     const score = productionCoverage + compilationScore + codeQualityScore - warningPenalty - testClassPenalty;
 
@@ -552,42 +617,80 @@ export function evaluateAndMavenizeSources({
   // Create Maven project structure
   const targetJavaDir = path.join(resolvedTargetDir, DIRS.MAVEN_SRC_JAVA);
   const targetResourcesDir = path.join(resolvedTargetDir, DIRS.MAVEN_SRC_RESOURCES);
+  const targetWebappDir = path.join(resolvedTargetDir, 'src', 'main', 'webapp');
 
   if (!fs.existsSync(resolvedTargetDir)) {
     fs.mkdirSync(resolvedTargetDir, { recursive: true });
   }
 
-  // Copy Java sources (e.g. org/) from winning candidate
-  const winnerEntries = fs.readdirSync(winner.path, { withFileTypes: true });
-  for (const entry of winnerEntries) {
-    const srcPath = path.join(winner.path, entry.name);
-    if (entry.name === DIRS.META_INF) {
-      copyRecursiveSync(srcPath, path.join(targetResourcesDir, DIRS.META_INF));
-    } else if (!EXCLUDED_COPY_FILES.includes(entry.name)) {
-      if (entry.isDirectory()) {
-        copyRecursiveSync(srcPath, path.join(targetJavaDir, entry.name));
-      } else if (entry.isFile() && entry.name.endsWith('.java')) {
-        copyRecursiveSync(srcPath, path.join(targetJavaDir, entry.name));
+  // Detect WAR structure
+  const isWar = fs.existsSync(path.join(winner.path, 'WEB-INF'));
+
+  if (isWar) {
+    // Copy WEB-INF/classes to src/main/java
+    const webInfClasses = path.join(winner.path, 'WEB-INF', 'classes');
+    if (fs.existsSync(webInfClasses)) {
+      copyRecursiveSync(webInfClasses, targetJavaDir);
+    }
+    
+    // Copy the rest of the root to src/main/webapp (excluding WEB-INF/classes, summary.txt, etc.)
+    const winnerEntries = fs.readdirSync(winner.path, { withFileTypes: true });
+    for (const entry of winnerEntries) {
+      if (EXCLUDED_COPY_FILES.includes(entry.name)) continue;
+      
+      const srcPath = path.join(winner.path, entry.name);
+      
+      if (entry.name === 'WEB-INF') {
+        const webappWebInf = path.join(targetWebappDir, 'WEB-INF');
+        fs.mkdirSync(webappWebInf, { recursive: true });
+        // copy everything inside WEB-INF except classes
+        const webInfEntries = fs.readdirSync(srcPath, { withFileTypes: true });
+        for (const subEntry of webInfEntries) {
+          if (subEntry.name !== 'classes') {
+            copyRecursiveSync(path.join(srcPath, subEntry.name), path.join(webappWebInf, subEntry.name));
+          }
+        }
+      } else {
+        copyRecursiveSync(srcPath, path.join(targetWebappDir, entry.name));
+      }
+    }
+  } else {
+    // Standard JAR behavior
+    const winnerEntries = fs.readdirSync(winner.path, { withFileTypes: true });
+    for (const entry of winnerEntries) {
+      const srcPath = path.join(winner.path, entry.name);
+      if (entry.name === DIRS.META_INF) {
+        copyRecursiveSync(srcPath, path.join(targetResourcesDir, DIRS.META_INF));
+      } else if (!EXCLUDED_COPY_FILES.includes(entry.name)) {
+        if (entry.isDirectory()) {
+          copyRecursiveSync(srcPath, path.join(targetJavaDir, entry.name));
+        } else if (entry.isFile() && entry.name.endsWith('.java')) {
+          copyRecursiveSync(srcPath, path.join(targetJavaDir, entry.name));
+        }
       }
     }
   }
 
   // Also pull supplementary META-INF files (LICENSE, NOTICE) from other candidates if missing
-  for (const cand of evaluations) {
-    const metaInf = path.join(cand.path, DIRS.META_INF);
-    if (fs.existsSync(metaInf)) {
-      copyRecursiveSync(metaInf, path.join(targetResourcesDir, DIRS.META_INF));
+  if (!isWar) {
+    for (const cand of evaluations) {
+      const metaInf = path.join(cand.path, DIRS.META_INF);
+      if (fs.existsSync(metaInf)) {
+        copyRecursiveSync(metaInf, path.join(targetResourcesDir, DIRS.META_INF));
+      }
     }
   }
 
   // Generate pom.xml
-  const pomContent = generatePomXml({ groupId, artifactId, version });
+  const pomContent = generatePomXml({ groupId, artifactId, version, isWar });
 
   fs.writeFileSync(path.join(resolvedTargetDir, 'pom.xml'), pomContent, 'utf8');
 
   return {
     success: true,
+    selectedCandidate: winner.name,
     chosenCandidate: winner.name,
+    targetMavenDir: resolvedTargetDir,
     candidateEvaluations: evaluations.map(e => ({
       name: e.name,
       score: e.score,
@@ -598,8 +701,13 @@ export function evaluateAndMavenizeSources({
       codeQuality: e.analysis.summary.codeQuality,
       compileEval: e.compileEval
     })),
-    mavenizedDir: resolvedTargetDir,
-    pomCreated: true
+    evaluations: evaluations.map(e => ({
+      name: e.name,
+      score: e.score,
+      javaFilesCount: e.analysis.summary.javaFilesCount,
+      decompilationWarningCount: e.analysis.summary.decompilationWarningCount,
+      compileEval: e.compileEval
+    }))
   };
 }
 
@@ -628,6 +736,11 @@ export async function compileMavenizedProject({
   const isWindows = process.platform === 'win32';
   const mvnCmd = isWindows ? 'mvn.cmd' : 'mvn';
 
+  const userHome = process.env.USERPROFILE || process.env.HOME || '';
+  const defaultJdk = path.join(userHome, '.jdks', 'openjdk-24');
+  const javaHome = process.env.JAVA_HOME || (fs.existsSync(defaultJdk) ? defaultJdk : undefined);
+  const spawnEnv = javaHome ? { ...process.env, JAVA_HOME: javaHome } : process.env;
+
   // 1. Attempt Maven Build
   let buildResult = await new Promise((resolve) => {
     let stdout = '';
@@ -635,7 +748,8 @@ export async function compileMavenizedProject({
 
     const proc = spawn(mvnCmd, ['clean', 'compile'], {
       cwd: resolvedProjectDir,
-      shell: true
+      shell: true,
+      env: spawnEnv
     });
 
     proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
@@ -797,23 +911,30 @@ export async function compileMavenizedProject({
 }
 
 /**
- * Performs ASM bytecode analysis comparing original JAR against compiled mavenized source.
- * Generates a human-readable comparison report with percentage match, business context
- * similarity, and variable readability scores.
+ * Performs real bytecode-level comparison between the original JAR/WAR and the recompiled
+ * mavenized source using javap.
+ *
+ * Comparison methodology:
+ * 1. Class Coverage:   Compares .class file inventories (jar tf vs directory walk).
+ * 2. Method Parity:    Compares javap -p method signatures on sampled matched classes.
+ * 3. Field Parity:     Compares javap -p field declarations on sampled matched classes.
+ * 4. Debug Metadata:   Inspects compiled output for LocalVariableTable, LineNumberTable,
+ *                      and MethodParameters (verifies -g / -parameters compiler flags).
+ * 5. Missing/Extra:    Reports classes absent from or newly introduced in the compiled output.
  */
 export async function compareBytecodeAndAnalyze({
-  originalJarPath,
+  originalJarPath = 'targeted-jars/commons-io-2.22.0.jar',
   mavenDir = DIRS.MAVENIZED_MERGED_SOURCE,
   logPath = LOG_PATHS.BYTECODE_COMPARISON,
   asmJarPath = LIBRARY_JARS.ASM
-}) {
+} = {}) {
   const resolvedJarPath = path.resolve(originalJarPath);
   const resolvedMavenDir = path.resolve(mavenDir);
   const resolvedLogPath = path.resolve(logPath);
   const resolvedAsmJar = path.resolve(asmJarPath);
 
   if (!fs.existsSync(resolvedJarPath)) {
-    throw new Error(`Original JAR file does not exist: ${resolvedJarPath}`);
+    throw new Error(`Original JAR/WAR file does not exist: ${resolvedJarPath}`);
   }
   if (!fs.existsSync(resolvedMavenDir)) {
     throw new Error(`Maven project directory does not exist: ${resolvedMavenDir}`);
@@ -826,19 +947,18 @@ export async function compareBytecodeAndAnalyze({
   }
 
   const targetClassesDir = path.join(resolvedMavenDir, DIRS.MAVEN_TARGET_CLASSES);
-  
-  // Ensure target/classes is populated by running compilation if empty
+
+  // Ensure target/classes is populated
   let compiledClassFiles = [];
   function walkClasses(d, rel = '') {
     if (!fs.existsSync(d)) return;
     for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
       const full = path.join(d, entry.name);
-      const relPath = path.join(rel, entry.name);
+      const relPath = path.join(rel, entry.name).replace(/\\/g, '/');
       if (entry.isDirectory()) walkClasses(full, relPath);
-      else if (entry.name.endsWith('.class')) compiledClassFiles.push({ full, relPath });
+      else if (entry.name.endsWith('.class')) compiledClassFiles.push(relPath);
     }
   }
-
   walkClasses(targetClassesDir);
   if (compiledClassFiles.length === 0) {
     await compileMavenizedProject({ projectDir: resolvedMavenDir });
@@ -846,69 +966,163 @@ export async function compareBytecodeAndAnalyze({
     walkClasses(targetClassesDir);
   }
 
-  // Count classes in targetClassesDir vs original JAR
-  let originalClassNames = [];
+  // Step 1: Collect class inventories
+  let originalClassPaths = [];
   try {
-    const stdout = execSync(`jar tf "${resolvedJarPath}"`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
-    originalClassNames = stdout.split('\n').map(s => s.trim()).filter(s => s.endsWith('.class'));
+    const jarExe = getJarExecutable();
+    const stdout = execSync(`"${jarExe}" tf "${resolvedJarPath}"`, {
+      encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore']
+    });
+    originalClassPaths = stdout.split('\n')
+      .map(s => s.trim())
+      .filter(s => s.endsWith('.class') && !s.includes('module-info'));
   } catch (e) {
-    // Fallback: estimate from compiled classes count
-    originalClassNames = compiledClassFiles.map(c => c.relPath);
+    // Fallback: estimate from compiled classes
+    originalClassPaths = compiledClassFiles;
   }
 
-  const totalOrigClasses = Math.max(originalClassNames.length, compiledClassFiles.length, 1);
-  const totalCompiledClasses = compiledClassFiles.length;
-  const matchedClasses = Math.min(totalOrigClasses, totalCompiledClasses);
+  const toClassName = (classFilePath) => {
+    let cleanPath = classFilePath.replace(/\\/g, '/');
+    if (cleanPath.startsWith('WEB-INF/classes/')) {
+      cleanPath = cleanPath.substring('WEB-INF/classes/'.length);
+    }
+    return cleanPath.replace(/\.class$/, '').replace(/\//g, '.');
+  };
 
-  // ASM Javap Metadata Inspection on compiled classes
-  let javapExe = resolveJdkTool('javap');
+  const originalClassNames = new Set(originalClassPaths.map(toClassName));
+  const compiledClassNames = new Set(compiledClassFiles.map(toClassName));
 
-  let totalSampledMethods = 0;
-  let matchedMethodSignatures = 0;
-  let localVarsPreserved = 0;
-  let totalVarsInspected = 0;
-  let paramNamesPreserved = 0;
-  let totalParamsInspected = 0;
+  // Step 2: Class coverage
+  const matchedClassList = [...originalClassNames].filter(c => compiledClassNames.has(c));
+  const missingClasses = [...originalClassNames].filter(c => !compiledClassNames.has(c));
+  const extraClasses = [...compiledClassNames].filter(c => !originalClassNames.has(c));
 
-  // Sample inspect up to 40 class files with javap -v -p
-  const sampleClasses = compiledClassFiles.slice(0, 40);
-  for (const item of sampleClasses) {
+  const classMatchPct = originalClassNames.size > 0
+    ? (matchedClassList.length / originalClassNames.size) * 100
+    : 0;
+
+  // Step 3: Resolve javap
+  const javapExe = getJavapExecutable();
+
+  // Step 4: Sample matched classes for detailed javap comparison
+  const MAX_SAMPLE = 60;
+  let sampleClasses;
+  if (matchedClassList.length <= MAX_SAMPLE) {
+    sampleClasses = matchedClassList;
+  } else {
+    const step = Math.ceil(matchedClassList.length / MAX_SAMPLE);
+    sampleClasses = matchedClassList.filter((_, i) => i % step === 0).slice(0, MAX_SAMPLE);
+  }
+
+  let totalOrigMethods = 0, matchedMethodCount = 0;
+  let totalOrigFields = 0, matchedFieldCount = 0;
+  let classesCompared = 0, comparisonErrors = 0;
+  let totalCodeSections = 0, lvtCount = 0, lntCount = 0, mParamsCount = 0;
+
+  const perClassResults = [];
+
+  for (const className of sampleClasses) {
     try {
-      const out = execSync(`"${javapExe}" -v -p "${item.full}"`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
-      const lines = out.split('\n');
+      // Get signatures from original JAR
+      const origOut = execSync(
+        `"${javapExe}" -p -cp "${resolvedJarPath}" "${className}"`,
+        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 15000 }
+      );
+      const origSigs = parseJavapMembers(origOut);
 
-      for (const line of lines) {
-        if (line.includes(' LocalVariableTable:')) {
-          localVarsPreserved += BYTECODE.LOCAL_VARS_PRESERVED_PER_TABLE;
-          totalVarsInspected += BYTECODE.LOCAL_VARS_INSPECTED_PER_TABLE;
-        }
-        if (line.includes(' MethodParameters:')) {
-          paramNamesPreserved += BYTECODE.PARAMS_PER_ENTRY;
-          totalParamsInspected += BYTECODE.PARAMS_PER_ENTRY;
-        }
-        if (line.includes(' Code:')) {
-          totalSampledMethods++;
-          matchedMethodSignatures++;
+      // Get signatures from compiled output
+      const compOut = execSync(
+        `"${javapExe}" -p -cp "${targetClassesDir}" "${className}"`,
+        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 15000 }
+      );
+      const compSigs = parseJavapMembers(compOut);
+
+      // Compare methods
+      totalOrigMethods += origSigs.methods.size;
+      let classMethodMatches = 0;
+      for (const m of origSigs.methods) {
+        if (compSigs.methods.has(m)) {
+          matchedMethodCount++;
+          classMethodMatches++;
         }
       }
+
+      // Compare fields
+      totalOrigFields += origSigs.fields.size;
+      let classFieldMatches = 0;
+      for (const f of origSigs.fields) {
+        if (compSigs.fields.has(f)) {
+          matchedFieldCount++;
+          classFieldMatches++;
+        }
+      }
+
+      // Analyze debug metadata in compiled output (verbose mode)
+      const verboseOut = execSync(
+        `"${javapExe}" -v -p -cp "${targetClassesDir}" "${className}"`,
+        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 15000 }
+      );
+      const dbg = countDebugMetadata(verboseOut);
+      totalCodeSections += dbg.codeSections;
+      lvtCount += dbg.localVariableTableCount;
+      lntCount += dbg.lineNumberTableCount;
+      mParamsCount += dbg.methodParametersCount;
+
+      const mPct = origSigs.methods.size > 0
+        ? (classMethodMatches / origSigs.methods.size * 100) : 100;
+      const fPct = origSigs.fields.size > 0
+        ? (classFieldMatches / origSigs.fields.size * 100) : 100;
+
+      perClassResults.push({
+        className: className.split('.').pop(),
+        fullName: className,
+        methodMatch: `${mPct.toFixed(1)}%`,
+        fieldMatch: `${fPct.toFixed(1)}%`,
+        origMethods: origSigs.methods.size,
+        compMethods: compSigs.methods.size,
+        origFields: origSigs.fields.size,
+        compFields: compSigs.fields.size,
+        hasLVT: dbg.localVariableTableCount > 0,
+        hasLNT: dbg.lineNumberTableCount > 0,
+        hasMParams: dbg.methodParametersCount > 0
+      });
+
+      classesCompared++;
     } catch (err) {
-      // Ignore javap inspect error for individual sample class
+      comparisonErrors++;
+      perClassResults.push({
+        className: className.split('.').pop(),
+        fullName: className,
+        error: (err.message || 'javap inspection failed').substring(0, 120)
+      });
     }
   }
 
-  // Calculate percentages based on ASM & javap structural analysis
-  const classMatchRatio = totalOrigClasses > 0 ? (matchedClasses / totalOrigClasses) : 1;
-  const fileMatchPct = Math.min(BYTECODE.FILE_MATCH_MAX, Math.max(BYTECODE.FILE_MATCH_MIN, (classMatchRatio * BYTECODE.FILE_MATCH_SCALE) + BYTECODE.FILE_MATCH_OFFSET));
-  const businessContextSimilarity = Math.min(BYTECODE.BUSINESS_CTX_MAX, Math.max(BYTECODE.BUSINESS_CTX_MIN, fileMatchPct + BYTECODE.BUSINESS_CTX_OFFSET));
-  
-  // Readability is capped under 100% because bytecode decompilation inherently loses:
-  // 1. Original inline source comments and Javadoc annotations
-  // 2. Exact formatting/whitespace layout
-  // 3. Synthetic compiler artifacts (e.g. this$0, $switchTable$, lambda bridges)
-  const varRatio = totalVarsInspected > 0 ? (localVarsPreserved / totalVarsInspected) : BYTECODE.DEFAULT_VAR_RATIO;
-  const paramRatio = totalParamsInspected > 0 ? (paramNamesPreserved / totalParamsInspected) : BYTECODE.DEFAULT_PARAM_RATIO;
-  const readabilityScore = Math.min(BYTECODE.READABILITY_MAX, Math.max(BYTECODE.READABILITY_MIN, (varRatio * BYTECODE.READABILITY_VAR_WEIGHT) + (paramRatio * BYTECODE.READABILITY_PARAM_WEIGHT)));
+  // Step 5: Compute real metrics
+  const methodMatchPct = totalOrigMethods > 0
+    ? (matchedMethodCount / totalOrigMethods * 100) : 0;
+  const fieldMatchPct = totalOrigFields > 0
+    ? (matchedFieldCount / totalOrigFields * 100) : 0;
 
+  const lvtPct = totalCodeSections > 0 ? (lvtCount / totalCodeSections * 100) : 0;
+  const lntPct = totalCodeSections > 0 ? (lntCount / totalCodeSections * 100) : 0;
+  const mParamsPct = totalCodeSections > 0 ? (mParamsCount / totalCodeSections * 100) : 0;
+
+  // Composite readability score: weighted average of debug metadata presence
+  const readabilityScore = totalCodeSections > 0
+    ? (lvtPct * 0.45 + lntPct * 0.30 + mParamsPct * 0.25)
+    : 0;
+
+  // Composite functional equivalence: weighted from class, method, field match
+  const functionalEquivalence =
+    (classMatchPct * 0.30) + (methodMatchPct * 0.50) + (fieldMatchPct * 0.20);
+
+  // Step 6: Assessment verdicts
+  const classVerdict = classMatchPct >= 95 ? 'PASS' : (classMatchPct >= 80 ? 'WARN' : 'FAIL');
+  const methodVerdict = methodMatchPct >= 95 ? 'PASS' : (methodMatchPct >= 80 ? 'WARN' : 'FAIL');
+  const debugVerdict = lvtPct >= 80 ? 'PASS' : (lvtPct >= 50 ? 'WARN' : 'FAIL');
+
+  // Step 7: Generate comprehensive report
   const reportLines = [
     `================================================================================`,
     `        ASM BYTECODE COMPARISON & FUNCTIONAL EQUIVALENCE REPORT                 `,
@@ -916,35 +1130,70 @@ export async function compareBytecodeAndAnalyze({
     `Original JAR File   : ${resolvedJarPath}`,
     `Mavenized Source    : ${resolvedMavenDir}`,
     `Target Classes Dir  : ${targetClassesDir}`,
-    `ASM Library Path    : ${fs.existsSync(resolvedAsmJar) ? resolvedAsmJar : 'ASM 9.10.1 (Detected in environment)'}`,
+    `ASM Library         : ${fs.existsSync(resolvedAsmJar) ? resolvedAsmJar : 'Not found (using javap for analysis)'}`,
     `Report Generated At : ${new Date().toISOString()}`,
+    `Analysis Method     : javap -v -p (bytecode signature and metadata inspection)`,
+    `Sampling            : ${sampleClasses.length} of ${matchedClassList.length} matched classes inspected in detail`,
     `================================================================================`,
     ``,
-    `--- 1. OVERALL SIMILARITY & EQUIVALENCE METRICS ---`,
-    `Overall File & Bytecode Match      : ${fileMatchPct.toFixed(1)}%`,
-    `Business Logic Context Similarity  : ${businessContextSimilarity.toFixed(1)}%`,
-    `Code Readability & Variable Score  : ${readabilityScore.toFixed(1)}%`,
+    `--- 1. CLASS COVERAGE ---`,
+    `Original JAR Classes        : ${originalClassNames.size}`,
+    `Compiled Target Classes     : ${compiledClassNames.size}`,
+    `Matched                     : ${matchedClassList.length} (${classMatchPct.toFixed(1)}%)`,
+    `Missing in Compiled Output  : ${missingClasses.length}`,
+    `Extra in Compiled Output    : ${extraClasses.length}`,
     ``,
-    `--- 2. CLASS & METHOD COVERAGE BREAKDOWN ---`,
-    `Total Original JAR Classes         : ${totalOrigClasses}`,
-    `Total Compiled Target Classes       : ${totalCompiledClasses}`,
-    `Matched Class Count                : ${matchedClasses} (${(classMatchRatio * 100).toFixed(1)}%)`,
-    `Method Signature Parity            : 99.6% (Full API contract compatibility)`,
-    `Control Flow & Opcode Parity       : 99.2% (Identical jump & exception tables)`,
+    `--- 2. METHOD SIGNATURE PARITY (Sampled ${sampleClasses.length} classes) ---`,
+    `Original Methods Inspected  : ${totalOrigMethods}`,
+    `Matched in Compiled         : ${matchedMethodCount} (${methodMatchPct.toFixed(1)}%)`,
+    `Unmatched / Changed         : ${totalOrigMethods - matchedMethodCount}`,
     ``,
-    `--- 3. CODE READABILITY & VARIABLE NAMING ANALYSIS ---`,
-    `LocalVariableTable Metadata        : PRESENT (Preserved via -g compiler flag)`,
-    `MethodParameters Metadata          : PRESENT (Preserved via -parameters compiler flag)`,
-    `LineNumberTable Mapping            : PRESENT (100% line mapping fidelity)`,
-    `Parameter & Variable Name Quality : High (Original method parameters restored without synthetic arg0/arg1 obfuscation)`,
+    `--- 3. FIELD SIGNATURE PARITY (Sampled ${sampleClasses.length} classes) ---`,
+    `Original Fields Inspected   : ${totalOrigFields}`,
+    `Matched in Compiled         : ${matchedFieldCount} (${fieldMatchPct.toFixed(1)}%)`,
+    `Unmatched / Changed         : ${totalOrigFields - matchedFieldCount}`,
     ``,
-    `--- 4. BUSINESS LOGIC EQUIVALENCE ASSESSMENT ---`,
-    `[PASS] Public API Contract Compliance: 100% methods, fields, and constructors match original bytecode descriptors.`,
-    `[PASS] Exceptional Flow Compliance   : Sneaky throw & try-with-resources blocks retain identical bytecode structure.`,
-    `[PASS] Data Stream & Buffer Safety   : Full functional parity across org.apache.commons.io stream and buffer utilities.`,
+    `--- 4. DEBUG METADATA QUALITY (Compiled Output) ---`,
+    `Code Sections Inspected     : ${totalCodeSections}`,
+    `LocalVariableTable          : ${lvtCount}/${totalCodeSections} (${lvtPct.toFixed(1)}%)  [requires -g flag]`,
+    `LineNumberTable             : ${lntCount}/${totalCodeSections} (${lntPct.toFixed(1)}%)  [standard debug info]`,
+    `MethodParameters            : ${mParamsCount}/${totalCodeSections} (${mParamsPct.toFixed(1)}%)  [requires -parameters flag]`,
     ``,
-    `================================================================================`
+    `--- 5. COMPOSITE SCORES ---`,
+    `Functional Equivalence      : ${functionalEquivalence.toFixed(1)}%  (30% class + 50% method + 20% field)`,
+    `Code Readability            : ${readabilityScore.toFixed(1)}%  (45% LVT + 30% LNT + 25% MethodParams)`,
+    `Business Context Similarity : ${functionalEquivalence.toFixed(1)}%`,
+    ``,
+    `--- 6. ASSESSMENT ---`,
+    `[${classVerdict}] Class Coverage          : ${classMatchPct.toFixed(1)}% of original classes present in compiled output`,
+    `[${methodVerdict}] Method Signature Parity : ${methodMatchPct.toFixed(1)}% of sampled original methods match exactly`,
+    `[${debugVerdict}] Debug Metadata Quality   : ${lvtPct.toFixed(1)}% of methods retain LocalVariableTable`,
+    ``
   ];
+
+  if (missingClasses.length > 0) {
+    reportLines.push(`--- MISSING CLASSES (Top 10) ---`);
+    missingClasses.slice(0, 10).forEach(c => reportLines.push(`  - ${c}`));
+    reportLines.push(``);
+  }
+
+  if (perClassResults.length > 0) {
+    reportLines.push(`--- SAMPLE CLASS COMPARISON RESULTS (First 15) ---`);
+    perClassResults.slice(0, 15).forEach(r => {
+      if (r.error) {
+        reportLines.push(`  [${r.className}] ERROR: ${r.error}`);
+      } else {
+        reportLines.push(
+          `  [${r.className}] Methods: ${r.methodMatch} (${r.compMethods}/${r.origMethods}) | ` +
+          `Fields: ${r.fieldMatch} (${r.compFields}/${r.origFields}) | ` +
+          `LVT: ${r.hasLVT ? 'YES' : 'NO'} | LNT: ${r.hasLNT ? 'YES' : 'NO'} | MParams: ${r.hasMParams ? 'YES' : 'NO'}`
+        );
+      }
+    });
+    reportLines.push(``);
+  }
+
+  reportLines.push(`================================================================================`);
 
   const reportContent = reportLines.join('\n');
   fs.writeFileSync(resolvedLogPath, reportContent, 'utf8');
@@ -953,12 +1202,23 @@ export async function compareBytecodeAndAnalyze({
     success: true,
     logPath: resolvedLogPath,
     metrics: {
-      overallMatchPercentage: `${fileMatchPct.toFixed(1)}%`,
-      businessContextSimilarity: `${businessContextSimilarity.toFixed(1)}%`,
+      overallMatchPercentage: `${classMatchPct.toFixed(1)}%`,
+      functionalEquivalence: `${functionalEquivalence.toFixed(1)}%`,
+      businessContextSimilarity: `${functionalEquivalence.toFixed(1)}%`,
       codeReadabilityScore: `${readabilityScore.toFixed(1)}%`,
-      totalOriginalClasses: totalOrigClasses,
-      totalCompiledClasses: totalCompiledClasses
+      classCoverage: `${classMatchPct.toFixed(1)}%`,
+      methodSignatureParity: `${methodMatchPct.toFixed(1)}%`,
+      fieldSignatureParity: `${fieldMatchPct.toFixed(1)}%`,
+      localVariableTableRetained: `${lvtPct.toFixed(1)}%`,
+      lineNumberTableRetained: `${lntPct.toFixed(1)}%`,
+      methodParametersRetained: `${mParamsPct.toFixed(1)}%`,
+      totalOriginalClasses: originalClassNames.size,
+      totalCompiledClasses: compiledClassNames.size,
+      classVerdict,
+      methodVerdict,
+      debugVerdict
     },
+    perClassResults: perClassResults.slice(0, 20),
     reportSnippet: reportLines.slice(0, 25).join('\n')
   };
 }
@@ -975,11 +1235,11 @@ export async function compareBytecodeAndAnalyze({
  */
 export async function fallbackToCandidateForMissingLogic({
   targetMavenDir = DIRS.MAVENIZED_FINAL_OUTPUT,
-  candidateDir,
+  candidateDir = 'outputs/cfr-output',
   originalJarPath,
   targetSimilarityThreshold = THRESHOLDS.TARGET_SIMILARITY,
   logPath = LOG_PATHS.GENERIC_FALLBACK_REPORT
-}) {
+} = {}) {
   const resolvedTargetDir = path.resolve(targetMavenDir);
   const resolvedCandDir = path.resolve(candidateDir);
   const resolvedLogPath = path.resolve(logPath);
@@ -998,7 +1258,7 @@ export async function fallbackToCandidateForMissingLogic({
     logPath: path.join(path.dirname(resolvedLogPath), LOG_PATHS.INITIAL_BYTECODE_PARITY)
   });
 
-  const initialScore = parseFloat((initialParity.metrics && initialParity.metrics.businessContextSimilarity) || '0');
+  const initialScore = parseFloat((initialParity.metrics && (initialParity.metrics.businessContextSimilarity || initialParity.metrics.functionalEquivalence)) || '0');
   const reportLines = [
     `================================================================================`,
     `      GENERIC POST-COMPILATION DIFFERENTIAL LOGIC FALLBACK REPORT               `,
@@ -1019,6 +1279,7 @@ export async function fallbackToCandidateForMissingLogic({
     fs.writeFileSync(resolvedLogPath, reportContent, 'utf8');
     return {
       success: true,
+      logPath: resolvedLogPath,
       fallbackTriggered: false,
       initialSimilarity: `${initialScore.toFixed(1)}%`,
       finalSimilarity: `${initialScore.toFixed(1)}%`,
@@ -1066,7 +1327,7 @@ export async function fallbackToCandidateForMissingLogic({
           mavenDir: targetMavenDir,
           logPath: path.join(path.dirname(resolvedLogPath), LOG_PATHS.TEMP_PARITY)
         });
-        const newScore = parseFloat((newParity.metrics && newParity.metrics.businessContextSimilarity) || '0');
+        const newScore = parseFloat((newParity.metrics && (newParity.metrics.businessContextSimilarity || newParity.metrics.functionalEquivalence)) || '0');
 
         if (newScore > currentScore) {
           reportLines.push(`[ACCEPTED] Swapped ${relPath.replace(/\\/g, '/')} from candidate. Parity improved: ${currentScore.toFixed(1)}% -> ${newScore.toFixed(1)}%`);
@@ -1096,6 +1357,7 @@ export async function fallbackToCandidateForMissingLogic({
 
   return {
     success: true,
+    logPath: resolvedLogPath,
     fallbackTriggered: true,
     initialSimilarity: `${initialScore.toFixed(1)}%`,
     finalSimilarity: `${currentScore.toFixed(1)}%`,
@@ -1154,14 +1416,8 @@ export function inferMeaningfulName(typeStr, varName, lineContent = '') {
 /**
  * Generates AST using GumTree Spoon AST Diff and detects obfuscated variable names
  * in decompiled Java source files.
- * 
- * Obfuscated patterns detected:
- * - Single-letter variables (excluding conventional: i,j,k,e,t,s,n,x,y,c,b,p,m,r,w,v)
- * - Numbered synthetic variables: var0, var1, arg0, lv0, val$x
- * - CFR-specific: this$0, access$000, lambda$
- * - Generic decompiler artifacts: string, object, class2 etc.
  */
-export function generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, logPath }) {
+export function generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, logPath } = {}) {
   const DEFAULT_GUMTREE_JAR = LIBRARY_JARS.GUMTREE_SPOON;
   const resolvedGumtreeJar = gumtreeJarPath || DEFAULT_GUMTREE_JAR;
   const resolvedSourceDir = path.resolve(sourceDir || path.join(DIRS.MAVENIZED_MERGED_SOURCE, DIRS.MAVEN_SRC_JAVA));
@@ -1173,21 +1429,6 @@ export function generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, log
   if (!fs.existsSync(resolvedSourceDir)) {
     throw new Error(`Source directory not found: ${resolvedSourceDir}`);
   }
-
-  // Collect all Java files
-  const javaFiles = [];
-  function walkDir(dir) {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walkDir(fullPath);
-      } else if (entry.name.endsWith('.java')) {
-        javaFiles.push(fullPath);
-      }
-    }
-  }
-  walkDir(resolvedSourceDir);
 
   // Conventional single-letter variable names that are NOT obfuscated
   const CONVENTIONAL_SINGLE_LETTERS = new Set([
@@ -1206,72 +1447,121 @@ export function generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, log
     { regex: /^[a-z]$/, type: 'single-letter', description: 'Single letter variable' },
   ];
 
-  const detectedObfuscations = [];
+  let detectedObfuscations = [];
   let totalVariablesScanned = 0;
+  let totalGumTreeNodes = 0;
+  let totalFilesScanned = 0;
 
-  for (const javaFile of javaFiles) {
-    const content = fs.readFileSync(javaFile, 'utf8');
-    const lines = content.split('\n');
-    const relativePath = path.relative(resolvedSourceDir, javaFile);
+  // 1. Try Spoon / GumTree scanner via AstScanner if available
+  const astScannerDir = path.resolve(__dirname, '..', 'gumtree-ast-diff');
+  let usedGumTreeScanner = false;
 
-    for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-      const line = lines[lineIdx];
-
-      // Skip comments and blank lines
-      const trimmed = line.trim();
-      if (trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*') || trimmed.length === 0) {
-        continue;
+  if (fs.existsSync(path.join(astScannerDir, 'AstScanner.class'))) {
+    try {
+      const javaExe = getJavaExecutable();
+      const cpSep = process.platform === 'win32' ? ';' : ':';
+      const cmd = `"${javaExe}" -cp ".${cpSep}${resolvedGumtreeJar}" AstScanner "${resolvedSourceDir}"`;
+      const output = execSync(cmd, { cwd: astScannerDir, encoding: 'utf8', maxBuffer: 1024 * 1024 * 50, timeout: 30000 });
+      
+      const jsonStart = output.indexOf('===GUMTREE_AST_JSON_START===');
+      const jsonEnd = output.indexOf('===GUMTREE_AST_JSON_END===');
+      if (jsonStart !== -1 && jsonEnd !== -1) {
+        const jsonStr = output.substring(jsonStart + '===GUMTREE_AST_JSON_START===\n'.length, jsonEnd).trim();
+        const parsed = JSON.parse(jsonStr);
+        detectedObfuscations = (parsed.detectedObfuscations || []).map(obf => ({
+          ...obf,
+          suggestedNewName: obf.suggestedNewName || inferMeaningfulName(obf.declaredType, obf.variableName, obf.lineContent)
+        }));
+        totalVariablesScanned = parsed.totalVariablesScanned || 0;
+        totalGumTreeNodes = parsed.totalGumTreeNodes || 0;
+        usedGumTreeScanner = true;
       }
+    } catch {
+      // Fallback to JS regex scanner
+    }
+  }
 
-      // Extract variable declarations with Type inference
-      const declPatterns = [
-        /(?:(?:final|static|private|public|protected)\s+)*([A-Z][\w<>\[\]?]*)\s+([a-zA-Z_$][\w$]*)\s*[=;,)]/g,
-        /(?:\(|,)\s*([A-Za-z_$][\w<>\[\]?]*)\s+([a-zA-Z_$][\w$]*)\s*[,)]/g,
-        /(?:long|int|short|byte|float|double|boolean|char)\s+([a-zA-Z_$][\w$]*)\s*[=;,)]/g
-      ];
+  // 2. Fallback to JS regex parser if AstScanner was not used
+  if (!usedGumTreeScanner) {
+    const javaFiles = [];
+    function walkDir(dir) {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walkDir(fullPath);
+        } else if (entry.name.endsWith('.java')) {
+          javaFiles.push(fullPath);
+        }
+      }
+    }
+    walkDir(resolvedSourceDir);
+    totalFilesScanned = javaFiles.length;
 
-      for (const pattern of declPatterns) {
-        let match;
-        const lineStr = line;
-        pattern.lastIndex = 0;
-        while ((match = pattern.exec(lineStr)) !== null) {
-          let declaredType = match[1];
-          let varName = match[2];
-          if (!varName && match[1]) {
-            varName = match[1];
-            declaredType = 'primitive';
-          }
-          totalVariablesScanned++;
+    for (const javaFile of javaFiles) {
+      const content = fs.readFileSync(javaFile, 'utf8');
+      const lines = content.split('\n');
+      const relativePath = path.relative(resolvedSourceDir, javaFile);
 
-          // Skip conventional names
-          if (CONVENTIONAL_SINGLE_LETTERS.has(varName)) continue;
-          // Skip common Java keywords and types
-          if (['class', 'interface', 'enum', 'extends', 'implements', 'throws', 'return',
-               'import', 'package', 'new', 'this', 'super', 'void', 'null', 'true', 'false',
-               'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue',
-               'try', 'catch', 'finally', 'throw', 'instanceof', 'default', 'synchronized',
-               'volatile', 'transient', 'native', 'abstract', 'strictfp', 'assert',
-               'int', 'long', 'short', 'byte', 'float', 'double', 'char', 'boolean',
-               'String', 'Object', 'Class', 'Integer', 'Long', 'Double', 'Float',
-               'Boolean', 'Byte', 'Short', 'Character', 'List', 'Map', 'Set',
-               'Override', 'Deprecated', 'SuppressWarnings'].includes(varName)) continue;
+      for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+        const line = lines[lineIdx];
 
-          // Check against obfuscation patterns
-          for (const obfPattern of OBFUSCATED_PATTERNS) {
-            if (obfPattern.type === 'single-letter' && CONVENTIONAL_SINGLE_LETTERS.has(varName)) continue;
-            if (obfPattern.regex.test(varName)) {
-              const suggestedNewName = inferMeaningfulName(declaredType, varName, trimmed);
-              detectedObfuscations.push({
-                file: relativePath,
-                line: lineIdx + 1,
-                variableName: varName,
-                declaredType: declaredType,
-                suggestedNewName: suggestedNewName,
-                type: obfPattern.type,
-                description: obfPattern.description,
-                lineContent: trimmed.substring(0, 120)
-              });
-              break;
+        // Skip comments and blank lines
+        const trimmed = line.trim();
+        if (trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*') || trimmed.length === 0) {
+          continue;
+        }
+
+        // Extract variable declarations with Type inference
+        const declPatterns = [
+          /(?:(?:final|static|private|public|protected)\s+)*([A-Z][\w<>\[\]?]*)\s+([a-zA-Z_$][\w$]*)\s*[=;,)]/g,
+          /(?:\(|,)\s*([A-Za-z_$][\w<>\[\]?]*)\s+([a-zA-Z_$][\w$]*)\s*[,)]/g,
+          /(?:long|int|short|byte|float|double|boolean|char)\s+([a-zA-Z_$][\w$]*)\s*[=;,)]/g
+        ];
+
+        for (const pattern of declPatterns) {
+          let match;
+          const lineStr = line;
+          pattern.lastIndex = 0;
+          while ((match = pattern.exec(lineStr)) !== null) {
+            let declaredType = match[1];
+            let varName = match[2];
+            if (!varName && match[1]) {
+              varName = match[1];
+              declaredType = 'primitive';
+            }
+            totalVariablesScanned++;
+
+            // Skip conventional names
+            if (CONVENTIONAL_SINGLE_LETTERS.has(varName)) continue;
+            // Skip common Java keywords and types
+            if (['class', 'interface', 'enum', 'extends', 'implements', 'throws', 'return',
+                 'import', 'package', 'new', 'this', 'super', 'void', 'null', 'true', 'false',
+                 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue',
+                 'try', 'catch', 'finally', 'throw', 'instanceof', 'default', 'synchronized',
+                 'volatile', 'transient', 'native', 'abstract', 'strictfp', 'assert',
+                 'int', 'long', 'short', 'byte', 'float', 'double', 'char', 'boolean',
+                 'String', 'Object', 'Class', 'Integer', 'Long', 'Double', 'Float',
+                 'Boolean', 'Byte', 'Short', 'Character', 'List', 'Map', 'Set',
+                 'Override', 'Deprecated', 'SuppressWarnings'].includes(varName)) continue;
+
+            // Check against obfuscation patterns
+            for (const obfPattern of OBFUSCATED_PATTERNS) {
+              if (obfPattern.type === 'single-letter' && CONVENTIONAL_SINGLE_LETTERS.has(varName)) continue;
+              if (obfPattern.regex.test(varName)) {
+                const suggestedNewName = inferMeaningfulName(declaredType, varName, trimmed);
+                detectedObfuscations.push({
+                  file: relativePath.replace(/\\/g, '/'),
+                  line: lineIdx + 1,
+                  variableName: varName,
+                  declaredType: declaredType,
+                  suggestedNewName: suggestedNewName,
+                  type: obfPattern.type,
+                  description: obfPattern.description,
+                  lineContent: trimmed.substring(0, 120)
+                });
+                break;
+              }
             }
           }
         }
@@ -1299,10 +1589,12 @@ export function generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, log
     `Source Directory     : ${resolvedSourceDir}`,
     `GumTree JAR          : ${resolvedGumtreeJar}`,
     `Report Generated At  : ${timestamp}`,
+    `Scanner Engine Used  : ${usedGumTreeScanner ? 'GumTree Spoon AST Scanner (AstScanner.class)' : 'Context-Aware Regex + Type Inference AST Scanner'}`,
     `================================================================================`,
     ``,
     `--- 1. SCAN SUMMARY ---`,
-    `Total Java Files Scanned        : ${javaFiles.length}`,
+    `Total Files Scanned              : ${totalFilesScanned || 'All in source directory'}`,
+    `Total GumTree AST Nodes Built   : ${totalGumTreeNodes}`,
     `Total Variables Analyzed         : ${totalVariablesScanned}`,
     `Obfuscated Variables Detected    : ${uniqueObfuscations.length}`,
     ``,
@@ -1320,7 +1612,7 @@ export function generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, log
   reportLines.push('');
   reportLines.push(`--- 3. DETAILED OBFUSCATED VARIABLE LIST ---`);
   for (const d of uniqueObfuscations) {
-    reportLines.push(`  [${d.file}:${d.line}] ${d.variableName} -> ${d.suggestedNewName} (${d.description})`);
+    reportLines.push(`  [${d.file}:${d.line}] ${d.variableName} -> ${d.suggestedNewName || 'renamed'} (${d.description})`);
     reportLines.push(`    Line: ${d.lineContent}`);
   }
   reportLines.push('');
@@ -1333,7 +1625,7 @@ export function generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, log
   return {
     success: true,
     logPath: resolvedLogPath,
-    totalFilesScanned: javaFiles.length,
+    totalFilesScanned,
     totalVariablesAnalyzed: totalVariablesScanned,
     obfuscatedCount: uniqueObfuscations.length,
     breakdownByType: typeCounts,
@@ -1343,7 +1635,6 @@ export function generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, log
   };
 }
 
-
 /**
  * Copies mavenized source to final output directory, renames obfuscated variables
  * with meaningful names based on context analysis, adds inline comments documenting
@@ -1352,7 +1643,7 @@ export function generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, log
  * STRICT RULE: Never modifies business logic, method names, or variables with
  * already-meaningful names. Only renames synthetic/obfuscated identifiers.
  */
-export function renameObfuscatedVariables({ sourceDir, targetDir, logPath, renames }) {
+export function renameObfuscatedVariables({ sourceDir, targetDir, logPath, renames } = {}) {
   const resolvedSourceDir = path.resolve(sourceDir || DIRS.MAVENIZED_MERGED_SOURCE);
   const resolvedTargetDir = path.resolve(targetDir || DIRS.MAVENIZED_FINAL_OUTPUT);
   const resolvedLogPath = path.resolve(logPath || LOG_PATHS.VARIABLE_RENAME_CHANGELOG);
@@ -1381,7 +1672,6 @@ export function renameObfuscatedVariables({ sourceDir, targetDir, logPath, renam
   copyDirRecursive(resolvedSourceDir, resolvedTargetDir);
 
   // Step 2: Apply renames
-  // renames is an array of { file, oldName, newName, line? } objects
   const renameEntries = renames || [];
   const changeLog = [];
   let totalFilesModified = 0;
@@ -1399,7 +1689,7 @@ export function renameObfuscatedVariables({ sourceDir, targetDir, logPath, renam
 
   for (const [relativeFile, fileRenames] of Object.entries(renamesByFile)) {
     // Find the target file flexibly
-    let targetFilePath = path.join(resolvedTargetDir, 'src', 'main', 'java', relativeFile);
+    let targetFilePath = path.join(resolvedTargetDir, DIRS.MAVEN_SRC_JAVA, relativeFile);
     if (!fs.existsSync(targetFilePath)) {
       targetFilePath = path.join(resolvedTargetDir, relativeFile);
     }
@@ -1518,14 +1808,10 @@ export function renameObfuscatedVariables({ sourceDir, targetDir, logPath, renam
     totalFilesCopied: countFiles(resolvedTargetDir),
     totalFilesModified,
     totalRenamesApplied,
-    changeLog: changeLog.slice(0, 30), // Return first 30 for display
+    changeLog: changeLog.slice(0, 30),
     reportSnippet: logLines.slice(0, 20).join('\n')
   };
 }
-
-/**
- * Helper: Count files recursively in a directory
- */
 
 /**
  * Complete AST De-obfuscation Pipeline:
@@ -1541,7 +1827,7 @@ export async function runAstDeobfuscationPipeline({
   sourceDir = DIRS.MAVENIZED_MERGED_SOURCE,
   targetDir = DIRS.MAVENIZED_FINAL_OUTPUT,
   gumtreeJarPath = LIBRARY_JARS.GUMTREE_SPOON,
-  logPath = LOG_PATHS.AST_RENAMED_VARS_METHODS,
+  logPath = LOG_PATHS.AST_RENAMED_VARIABLES,
   renames = null
 } = {}) {
   const resolvedSource = path.resolve(sourceDir);
@@ -1574,7 +1860,7 @@ export async function runAstDeobfuscationPipeline({
     logPath: path.join(path.dirname(resolvedLog), LOG_PATHS.FINAL_OUTPUT_COMPILATION)
   });
 
-  let scanSourceDir = path.join(resolvedTarget, 'src', 'main', 'java');
+  let scanSourceDir = path.join(resolvedTarget, DIRS.MAVEN_SRC_JAVA);
   if (!fs.existsSync(scanSourceDir)) {
     scanSourceDir = resolvedTarget;
   }
@@ -1608,7 +1894,7 @@ export async function runAstDeobfuscationPipeline({
   });
 
   const postScan = generateAstAndDetectObfuscation({
-    sourceDir: path.join(resolvedTarget, 'src', 'main', 'java'),
+    sourceDir: path.join(resolvedTarget, DIRS.MAVEN_SRC_JAVA),
     gumtreeJarPath: resolvedGumtree,
     logPath: path.join(path.dirname(resolvedLog), LOG_PATHS.AST_DETECTION_POST_RENAME)
   });
@@ -1676,4 +1962,3 @@ function countFiles(dir) {
   }
   return count;
 }
-

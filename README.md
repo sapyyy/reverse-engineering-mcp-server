@@ -12,7 +12,7 @@ A production-ready **Model Context Protocol (MCP)** server written in Node.js fo
 5. [Setup & Installation](#4-setup--installation)
 6. [MCP Client Configurations](#5-mcp-client-configurations)
 7. [Complete MCP Tools Reference (10 Tools)](#6-complete-mcp-tools-reference-10-tools)
-8. [Complete MCP Prompts Reference (5 Prompts)](#7-complete-mcp-prompts-reference-5-prompts)
+8. [Complete MCP Prompts Reference (6 Prompts)](#7-complete-mcp-prompts-reference-6-prompts)
 9. [Execution Verification](#8-execution-verification)
 
 ---
@@ -257,7 +257,7 @@ Generic post-compilation differential fallback. If ASM business logic similarity
 
 ---
 
-## 7. Complete MCP Prompts Reference (5 Prompts)
+## 7. Complete MCP Prompts Reference (6 Prompts)
 
 ### 1. `evaluate_and_mavenize_prompt`
 System prompt for comparing decompiled AST outputs, selecting the optimal candidate with minimal code loss, and mavenizing it.
@@ -275,7 +275,11 @@ System prompt for running ASM bytecode comparisons between the original JAR and 
 System prompt for AST-based detection and renaming of obfuscated/synthetic variable names in decompiled Java source, preserving all business logic.
 - **Arguments**: `sourceDir`, `targetDir`, `logPath`
 
-### 5. `ast_deobfuscation_pipeline_prompt`
+### 5. `reverse_engineering_pipeline_prompt`
+System prompt to execute the complete reverse engineering pipeline: dual decompilation (CFR/Vineflower), metric-based evaluation, mavenization, incremental compilation, and bytecode comparison.
+- **Arguments**: `jarPath`, `cfrOutputDir`, `vineflowerOutputDir`, `mavenDir`
+
+### 6. `ast_deobfuscation_pipeline_prompt`
 Comprehensive system prompt for copying source to final output, compiling baseline, building GumTree Spoon AST, detecting obfuscated vars/methods, applying context-aware renames, verifying build success, and writing log files.
 - **Arguments**: `sourceDir`, `targetDir`, `logPath`
 

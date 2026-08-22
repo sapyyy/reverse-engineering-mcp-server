@@ -121,7 +121,9 @@ export const TEMP_FILES = {
 // =============================================================================
 export const LIBRARY_JARS = {
   ASM: path.resolve(PROJECT_ROOT, 'asm-bytecode-analysis', 'asm-9.10.1.jar'),
-  GUMTREE_SPOON: path.resolve(PROJECT_ROOT, 'gumtree-ast-diff', 'gumtree-spoon-ast-diff-1.124.jar'),
+  GUMTREE_SPOON: fs.existsSync(path.resolve(PROJECT_ROOT, 'gumtree-ast-diff', 'gumtree-spoon-ast-diff-1.124-jar-with-dependencies.jar'))
+    ? path.resolve(PROJECT_ROOT, 'gumtree-ast-diff', 'gumtree-spoon-ast-diff-1.124-jar-with-dependencies.jar')
+    : path.resolve(PROJECT_ROOT, 'gumtree-ast-diff', 'gumtree-spoon-ast-diff-1.124.jar'),
 };
 
 // =============================================================================
@@ -225,6 +227,7 @@ export function generatePomXml({
   artifactId = MAVEN_DEFAULTS.ARTIFACT_ID,
   version = MAVEN_DEFAULTS.VERSION,
   javaVersion = POM_VERSIONS.JAVA_SOURCE_TARGET,
+  isWar = false,
   extraDependencies = [],
   compilerArgs = []
 } = {}) {
@@ -251,6 +254,18 @@ ${compilerArgs.map(a => `                    <arg>${a}</arg>`).join('\n')}
                 </compilerArgs>`
     : '';
 
+  const warPluginXml = isWar
+    ? `
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-war-plugin</artifactId>
+                <version>3.4.0</version>
+                <configuration>
+                    <failOnMissingWebXml>false</failOnMissingWebXml>
+                </configuration>
+            </plugin>`
+    : '';
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -262,6 +277,7 @@ ${compilerArgs.map(a => `                    <arg>${a}</arg>`).join('\n')}
     <version>${version}</version>
     <name>${artifactId}</name>
     <description>Decompiled and Mavenized codebase for ${artifactId}</description>
+    ${isWar ? '<packaging>war</packaging>' : ''}
 
     <properties>
         <maven.compiler.source>${javaVersion}</maven.compiler.source>
@@ -283,7 +299,7 @@ ${depsXml}
                     <source>${javaVersion}</source>
                     <target>${javaVersion}</target>${compilerArgsXml}
                 </configuration>
-            </plugin>
+            </plugin>${warPluginXml}
         </plugins>
     </build>
 </project>

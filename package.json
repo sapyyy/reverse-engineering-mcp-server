@@ -9,7 +9,7 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check src/index.js && node --check src/decompilerHandler.js"
+    "check": "node --check index.js && node --check src/index.js && node --check src/decompilerHandler.js && node --check src/tools/definitions.js && node --check src/prompts/definitions.js && node --check bin/cli.js"
   },
   "keywords": [
     "mcp",
@@ -29,7 +29,9 @@
   "author": "Antigravity Engineering",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.5.0"
+    "@modelcontextprotocol/sdk": "^1.5.0",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -8,8 +8,9 @@ import {
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import { ZodError } from 'zod';
 
-import { TOOLS } from './tools/definitions.js';
+import { TOOLS, TOOL_DEFINITIONS } from './tools/definitions.js';
 import { PROMPTS, getPromptContent } from './prompts/definitions.js';
 import { SERVER_NAME, SERVER_VERSION } from './config.js';
 import {
@@ -58,31 +59,36 @@ server.setRequestHandler(ListPromptsRequestSchema, async () => {
  */
 server.setRequestHandler(GetPromptRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  return getPromptContent(name, args);
+  try {
+    return getPromptContent(name, args);
+  } catch (error) {
+    if (error instanceof ZodError) {
+      throw new Error(`Invalid arguments for prompt '${name}': ${error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ')}`);
+    }
+    throw error;
+  }
 });
 
 /**
  * Handle tool execution
  */
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: rawArgs } = request.params;
 
   try {
+    const toolDef = TOOL_DEFINITIONS.find(t => t.name === name);
+    if (!toolDef) {
+      throw new Error(`Unknown tool requested: ${name}. Available tools: ${TOOL_DEFINITIONS.map(t => t.name).join(', ')}`);
+    }
+
+    // Validate inputs with Zod
+    const args = toolDef.inputSchema.parse(rawArgs || {});
+
+    let result;
+    let textContent = '';
+
     if (name === 'decompile_jar') {
-      const { jarPath, outputDir, decompilerPath, decompilerType, extraArgs } = args || {};
-
-      if (!jarPath) {
-        throw new Error('Missing required argument: jarPath');
-      }
-
-      const result = await decompileJar({
-        jarPath,
-        outputDir,
-        decompilerPath,
-        decompilerType,
-        extraArgs
-      });
-
+      result = await decompileJar(args);
       const formattedResponse = [
         `==================================================`,
         `          JAVA JAR DECOMPILATION REPORT          `,
@@ -96,19 +102,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `Executed Command   : ${result.executionDetails.commandLine}`,
         ``,
         `--- DECOMPILATION SUMMARY ---`,
-        `Total Files        : ${result.decompilationInfo.summary.totalFiles}`,
-        `Decompiled .java   : ${result.decompilationInfo.summary.javaFilesCount}`,
-        `Remaining .class   : ${result.decompilationInfo.summary.remainingClassFilesCount}`,
-        `Resource Files     : ${result.decompilationInfo.summary.resourceFilesCount}`,
-        `Total Output Size  : ${result.decompilationInfo.summary.totalSizeFormatted}`,
-        `Decompile Warnings : ${result.decompilationInfo.summary.decompilationWarningCount}`,
+        `Total Files        : ${result.decompilationInfo?.summary?.totalFiles ?? 0}`,
+        `Decompiled .java   : ${result.decompilationInfo?.summary?.javaFilesCount ?? 0}`,
+        `Remaining .class   : ${result.decompilationInfo?.summary?.remainingClassFilesCount ?? 0}`,
+        `Resource Files     : ${result.decompilationInfo?.summary?.resourceFilesCount ?? 0}`,
+        `Total Output Size  : ${result.decompilationInfo?.summary?.totalSizeFormatted ?? '0 B'}`,
+        `Decompile Warnings : ${result.decompilationInfo?.summary?.decompilationWarningCount ?? 0}`,
         ``,
         `--- DIRECTORY TREE PREVIEW ---`,
-        `${result.decompilationInfo.directoryTree}`,
+        `${result.decompilationInfo?.directoryTree ?? 'No tree available'}`,
         ``
       ];
 
-      if (result.decompilationInfo.warningsAndErrors && result.decompilationInfo.warningsAndErrors.length > 0) {
+      if (result.decompilationInfo?.warningsAndErrors?.length > 0) {
         formattedResponse.push(`--- DECOMPILATION ISSUES/WARNINGS (Top 10) ---`);
         result.decompilationInfo.warningsAndErrors.slice(0, 10).forEach(w => {
           formattedResponse.push(`[${w.file}:${w.line}] ${w.message}`);
@@ -116,180 +122,93 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         formattedResponse.push(``);
       }
 
-      if (result.logs.stderr && result.logs.stderr.trim().length > 0) {
+      if (result.logs?.stderr?.trim().length > 0) {
         formattedResponse.push(`--- DECOMPILER STDERR LOG ---`);
         formattedResponse.push(result.logs.stderr.trim().slice(-2000));
         formattedResponse.push(``);
       }
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: formattedResponse.join('\n')
-          }
-        ]
-      };
+      textContent = formattedResponse.join('\n');
     }
-
-    if (name === 'list_decompilers') {
-      const { decompilerDir } = args || {};
-      const decompilers = listAvailableDecompilers(decompilerDir);
-
+    else if (name === 'list_decompilers') {
+      const decompilers = listAvailableDecompilers(args.decompilerDir);
+      result = decompilers;
       if (decompilers.length === 0) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'No decompiler jars/binaries found in the decompiler directory. Please copy CFR, Vineflower, Fernflower, or Procyon jar files into the "decompiler/" directory.'
-            }
-          ]
-        };
+        textContent = 'No decompiler jars/binaries found in the decompiler directory. Please copy CFR, Vineflower, Fernflower, or Procyon jar files into the "decompiler/" directory.';
+      } else {
+        textContent = [
+          `Found ${decompilers.length} decompiler(s):`,
+          ...decompilers.map((d, i) => `${i + 1}. ${d.filename} (Type: ${d.detectedType}, Path: ${d.path}, Size: ${(d.sizeBytes / 1024 / 1024).toFixed(2)} MB)`)
+        ].join('\n');
       }
-
-      const lines = [
-        `Found ${decompilers.length} decompiler(s):`,
-        ...decompilers.map((d, i) => `${i + 1}. ${d.filename} (Type: ${d.detectedType}, Path: ${d.path}, Size: ${(d.sizeBytes / 1024 / 1024).toFixed(2)} MB)`)
-      ];
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: lines.join('\n')
-          }
-        ]
-      };
+    }
+    else if (name === 'analyze_decompilation_output') {
+      result = analyzeOutputDirectory(args.outputDir);
+      textContent = `Analysis of directory: ${args.outputDir} complete.`;
+    }
+    else if (name === 'evaluate_and_mavenize_sources') {
+      result = evaluateAndMavenizeSources(args);
+      textContent = `Mavenization complete. Selected candidate: ${result.selectedCandidate}`;
+    }
+    else if (name === 'compile_maven_project') {
+      result = await compileMavenizedProject(args);
+      textContent = `Compilation finished. Errors: ${result.errorCount}. Logs at: ${result.logPath}`;
+    }
+    else if (name === 'compare_bytecode_and_analyze') {
+      result = await compareBytecodeAndAnalyze(args);
+      textContent = `Bytecode comparison complete. Report at: ${result.logPath}`;
+    }
+    else if (name === 'generate_ast_and_detect_obfuscation') {
+      result = generateAstAndDetectObfuscation(args);
+      textContent = `AST detection complete. Obfuscated variables found: ${result.obfuscatedCount}`;
+    }
+    else if (name === 'rename_obfuscated_variables') {
+      result = renameObfuscatedVariables(args);
+      textContent = `Variables renamed successfully. Total renamed: ${result.totalRenamesApplied}`;
+    }
+    else if (name === 'run_ast_deobfuscation_pipeline') {
+      result = await runAstDeobfuscationPipeline(args);
+      textContent = `End-to-end AST pipeline complete. Log available at: ${result.logPath}`;
+    }
+    else if (name === 'fallback_to_candidate_for_missing_logic') {
+      result = await fallbackToCandidateForMissingLogic(args);
+      textContent = `Generic differential logic fallback complete. Log available at: ${result.logPath}`;
     }
 
-    if (name === 'analyze_decompilation_output') {
-      const { outputDir } = args || {};
-      if (!outputDir) {
-        throw new Error('Missing required argument: outputDir');
-      }
+    // Validate outbound result against schema
+    const safeResult = toolDef.outputSchema.parse(result);
 
-      const info = analyzeOutputDirectory(outputDir);
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(info, null, 2)
-          }
-        ]
-      };
-    }
-
-    if (name === 'evaluate_and_mavenize_sources') {
-      const { outputsDir, targetMavenDir, groupId, artifactId, version } = args || {};
-      if (!outputsDir || !targetMavenDir) {
-        throw new Error('Missing required arguments: outputsDir and targetMavenDir');
-      }
-
-      const result = evaluateAndMavenizeSources({ outputsDir, targetMavenDir, groupId, artifactId, version });
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(result, null, 2)
-          }
-        ]
-      };
-    }
-
-    if (name === 'compile_maven_project') {
-      const { projectDir, logPath } = args || {};
-      if (!projectDir) {
-        throw new Error('Missing required argument: projectDir');
-      }
-
-      const result = await compileMavenizedProject({ projectDir, logPath });
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(result, null, 2)
-          }
-        ]
-      };
-    }
-
-    if (name === 'compare_bytecode_and_analyze') {
-      const { originalJarPath, mavenDir, logPath, asmJarPath } = args || {};
-      const result = await compareBytecodeAndAnalyze({ originalJarPath, mavenDir, logPath, asmJarPath });
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(result, null, 2)
-          }
-        ]
-      };
-    }
-
-    if (name === 'generate_ast_and_detect_obfuscation') {
-      const { sourceDir, gumtreeJarPath, logPath } = args || {};
-      const result = generateAstAndDetectObfuscation({ sourceDir, gumtreeJarPath, logPath });
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(result, null, 2)
-          }
-        ]
-      };
-    }
-
-    if (name === 'rename_obfuscated_variables') {
-      const { sourceDir, targetDir, logPath, renames } = args || {};
-      if (!renames || !Array.isArray(renames)) {
-        throw new Error('Missing required argument: renames (must be an array of {file, oldName, newName} objects)');
-      }
-      const result = renameObfuscatedVariables({ sourceDir, targetDir, logPath, renames });
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(result, null, 2)
-          }
-        ]
-      };
-    }
-
-    if (name === 'run_ast_deobfuscation_pipeline') {
-      const { sourceDir, targetDir, gumtreeJarPath, logPath, renames } = args || {};
-      const result = await runAstDeobfuscationPipeline({ sourceDir, targetDir, gumtreeJarPath, logPath, renames });
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(result, null, 2)
-          }
-        ]
-      };
-    }
-
-    if (name === 'fallback_to_candidate_for_missing_logic') {
-      const { targetMavenDir, candidateDir, originalJarPath, targetSimilarityThreshold, logPath } = args || {};
-      const result = await fallbackToCandidateForMissingLogic({ targetMavenDir, candidateDir, originalJarPath, targetSimilarityThreshold, logPath });
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(result, null, 2)
-          }
-        ]
-      };
-    }
-
-    throw new Error(`Unknown tool requested: ${name}`);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: textContent
+        },
+        {
+          type: 'text',
+          text: `\n### Structured Result Data\n\`\`\`json\n${JSON.stringify(safeResult, null, 2)}\n\`\`\``
+        }
+      ]
+    };
   } catch (error) {
+    let errorMessage = error.message;
+    let suggestions = '';
+
+    if (error instanceof ZodError) {
+      errorMessage = 'Input validation failed: ' + error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
+      suggestions = `\nPlease ensure your tool arguments perfectly match the tool's schema.`;
+    } else if (error.code === 'ENOENT') {
+      errorMessage = `File or directory not found: ${error.path}`;
+      suggestions = `\nPlease check if the file path is correct or if the necessary tools are installed.`;
+    } else {
+      suggestions = `\nPlease verify your inputs or check the server logs for more details.`;
+    }
+
     return {
       isError: true,
       content: [
         {
           type: 'text',
-          text: `Error executing tool '${name}': ${error.message}`
+          text: `Error executing tool '${name}': ${errorMessage}${suggestions}`
         }
       ]
     };
